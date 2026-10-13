@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+
+# 本地数据目录（正常情况下在 ~/.noa，此处只是防呆）
+.noa/
+.zcode/
+.pi/
+.tmp-*
+*.tsbuildinfo
+.DS_Store
+Thumbs.db

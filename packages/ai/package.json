@@ -1,0 +1,28 @@
+{
+  "name": "@noa/ai",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenAI-compatible streaming client: hand-rolled fetch + SSE, retry, usage extraction.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noa/core": "workspace:*"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0"
+  }
+}

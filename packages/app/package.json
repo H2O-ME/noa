@@ -1,0 +1,35 @@
+{
+  "name": "@noa/app",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Noa 应用壳：配置、内核装配、常驻宿主与 `noa` 可执行入口。",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    }
+  },
+  "bin": {
+    "noa": "./dist/index.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noa/ai": "workspace:*",
+    "@noa/channel-qq": "workspace:*",
+    "@noa/core": "workspace:*",
+    "@noa/plugins": "workspace:*",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

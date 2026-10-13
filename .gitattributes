@@ -1,0 +1,7 @@
+# 统一行尾：仓库与工作树一律 LF（本仓以 Windows 为主要开发平台，不锁行尾会
+# 产生大量 CRLF/LF 噪音与 blame 污染）。二进制按扩展名豁免。
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.woff binary
+*.woff2 binary

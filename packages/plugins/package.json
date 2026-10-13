@@ -1,0 +1,33 @@
+{
+  "name": "@noa/plugins",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Micro plugin container: services, tools, commands, hooks; built-in fs/bash tool plugins.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noa/core": "workspace:*"
+  },
+  "optionalDependencies": {
+    "@noa/plugin-context": "workspace:*",
+    "@noa/plugin-ptc": "workspace:*",
+    "@noa/plugin-subagent": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

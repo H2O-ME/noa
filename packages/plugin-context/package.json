@@ -1,0 +1,28 @@
+{
+  "name": "@noa/plugin-context",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "上下文洞察插件（advanced 档，按 spec 装载）：会话窗口折叠；缺失不影响主程序。",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noa/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

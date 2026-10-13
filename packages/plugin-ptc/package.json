@@ -1,0 +1,28 @@
+{
+  "name": "@noa/plugin-ptc",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "PTC / Code Mode 插件（advanced 档，按 spec 装载）：worker 线程内跑模型写的 TypeScript；缺失不影响主程序。",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noa/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

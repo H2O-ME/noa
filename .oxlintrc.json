@@ -1,0 +1,12 @@
+{
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    "no-unused-vars": "error",
+    "complexity": ["warn", 22],
+    "max-depth": ["warn", 5],
+    "max-lines-per-function": ["warn", { "max": 120, "skipBlankLines": true, "skipComments": true }]
+  },
+  "ignorePatterns": ["**/dist/**", ".reference/**"]
+}
