@@ -16,11 +16,13 @@
  *    auto-compact gate belongs inside every request rather than at turn
  *    boundaries (the same reason `nova exec` sets it).
  */
+import os from 'node:os';
 import type { ChatProvider } from '@noa/core';
 import { createAgentKernel, type Kernel } from '@noa/plugins';
 import { loadConfig, type Config } from './config.js';
 import { readPluginEntries } from './config-read.js';
 import { readPluginEntryConfig, setPluginEntry, setSkillEnabled } from './config-write.js';
+import { buildNoaSystemPrompt, readSoul } from './prompt.js';
 import { configuredModel, createProvider, createTitleProvider } from './provider.js';
 
 /** Everything a boot needs; the provider is injectable so tests never dial out. */
@@ -48,6 +50,10 @@ export async function bootKernel(opts: BootOptions): Promise<Kernel> {
   // and a boot-time capture would keep titling with a model the operator already
   // replaced. A failure to read means "no titles" — a label never blocks a run.
   const homedir = opts.homedir;
+  // The product's own persona, not the kernel's fallback: identity + the QQ
+  // channel's rendering and send-window facts. The operator's `SOUL.md`, when
+  // they wrote one, replaces the identity block and nothing else.
+  const systemPrompt = buildNoaSystemPrompt(await readSoul(homedir ?? os.homedir()));
   const titleProvider = async (): Promise<ChatProvider | undefined> => {
     try {
       return createTitleProvider(await loadConfig(homedir));
@@ -60,6 +66,8 @@ export async function bootKernel(opts: BootOptions): Promise<Kernel> {
     provider,
     model: provider.model ?? configuredModel(opts.config) ?? '',
     config: toKernelConfig(opts.config),
+    // The product's persona, replacing the kernel's generic fallback.
+    systemPrompt,
     perRequestCompact: true,
     userQuestions: true,
     // The anchor for bare module specs in `plugins.entries`: this app's own

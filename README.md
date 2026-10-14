@@ -65,6 +65,16 @@ pnpm workspace，8 个包，依赖严格单向：
 
 `{env:NAME}` 按**归属**展开：核心段（`provider`）的未解析引用拦住启动，插件行里的降级成诊断——某个插件的密钥没设置，不会把整个产品拖下水。
 
+## 系统提示词与渠道事实
+
+Noa 的提示词是**产品自己的**，住在 `packages/app/src/prompt.ts`（内核那份 `plugins/src/system-prompt.ts` 已退回成产品中立的兜底，只服务没有自带提示词的装配）。结构参考 [Hermes Agent](https://github.com/NousResearch/hermes-agent)：**稳定身份** + **逐通道的渲染事实**。
+
+- `NOA_IDENTITY` —— 身份与说话方式（驻留服务器、用户用手机；按问题分量给回复长度；不写废话、不复述、不播报工具调用）。
+- `QQ_CHANNEL_HINT` —— QQ 这条通道的**事实**：markdown 可用但不要表格；消息要短；**给用户文件必须走 `qq_send_file`**，且平台只在入站消息的回复窗口内接受文件；用户看不见这台机器，没写进回复或没发成文件的东西他就看不到。
+- `NOA_WORKING_STYLE` / `NOA_TOOLS` / `NOA_SAFETY` —— 干活纪律、**按本产品真实注册的工具名**写的工具说明（`read_file` / `search_files` / `bash` / `jobs` / `todo_write` / `create_goal` / `switch_workspace` / `run_code` / `subagent` / `skill` / `qq_send_file`），以及无人值守下的安全底线。
+
+**`~/.noa/SOUL.md`**：写一份就把身份块整个换掉（其余段落不变），不写就用内置身份。文件读不到不算致命——人格文件永远不该是机器人起不来的原因。
+
 ## 命令
 
 | 命令 | 说明 |
