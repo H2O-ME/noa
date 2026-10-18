@@ -1,0 +1,29 @@
+[Unit]
+Description=Noa — QQ resident agent
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/noa
+# The search key lives here, not in config.json: one file to protect, and the
+# config stays copyable without a credential in it.
+EnvironmentFile=/opt/noa/noa.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /opt/noa/packages/app/dist/index.mjs
+# A resident bot that dies must come back — but not in a tight loop, which would
+# hammer the QQ gateway with reconnects.
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+# The app handles SIGTERM itself (host.ts): it closes the socket and flushes the
+# session log, so give it a moment rather than pulling the plug.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=noa
+
+[Install]
+WantedBy=multi-user.target

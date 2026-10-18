@@ -1,0 +1,13 @@
+[Unit]
+Description=Noa — check origin for new commits every 5 minutes
+
+[Timer]
+# 开机后先等两分钟：机器刚起来时网络和 pnpm 都可能还没就绪，抢在最前面跑只会
+# 白失败一次。
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=noa-update.service
+
+[Install]
+WantedBy=timers.target

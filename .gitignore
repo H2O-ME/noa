@@ -2,6 +2,11 @@ node_modules/
 dist/
 *.log
 
+# 部署机密（systemd 的 EnvironmentFile，只存在于服务器）。这条尤其要紧：服务器
+# 上的部署目录就是这个仓库，一次手滑的 `git add -A` 会把搜索密钥带上 GitHub。
+noa.env
+*.env
+
 # 本地数据目录（正常情况下在 ~/.noa，此处只是防呆）
 .noa/
 .zcode/

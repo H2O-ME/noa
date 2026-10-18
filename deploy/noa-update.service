@@ -1,0 +1,16 @@
+[Unit]
+Description=Noa — pull origin, rebuild, restart if it moved
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/noa
+ExecStart=/opt/noa/scripts/noa-update.sh
+# 构建不是瞬时的，而 oneshot 的默认超时在部分 systemd 版本上并不如文档所说
+# 是「禁用」——写死一个够宽的值，免得构建中途被 SIGTERM 打断、留下半新半旧的
+# dist。
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=noa-update
