@@ -70,39 +70,6 @@ export interface PluginManifest {
    *    "按需开启" means for whole execution modes and external channels.
    */
   readonly tier: PluginTier;
-  /**
-   * Whether the plugin answers a settings `page` operation.
-   *
-   * It is declared rather than discovered so the browser can draw the settings
-   * navigation from the roster — without asking every plugin, and without the
-   * host keeping a list of which plugins have a page. A plugin that says yes and
-   * then fails to answer shows the failure in its own section, which is the same
-   * treatment every other plugin fault gets.
-   */
-  readonly page?: boolean;
-  /**
-   * The plugin's BROWSER-side bundle, when it ships one. Absent means a
-   * server-only plugin — the common case, since most plugins extend the kernel
-   * container with tools/services and need nothing in the browser. Declaring it
-   * puts the plugin on the browser's boot graph, which fetches and registers the
-   * bundle on boot; the URL and cache rules are the roster row's
-   * (`PluginRosterEntry.clientBundle`).
-   */
-  readonly clientBundle?: PluginClientBundle;
-}
-
-/**
- * Where one plugin's browser bundle lives, as the plugin itself declares it.
- *
- * One shape for both halves of the same fact — the manifest's declaration and
- * the roster row's boot-graph entry — so a plugin author writes it once and the
- * browser reads exactly what was written.
- */
-export interface PluginClientBundle {
-  /** Path under the plugin's `/plugins/<name>/` prefix; defaults to `client.js`. */
-  readonly path?: string;
-  /** Content rev (a hash or version string) for cache busting. */
-  readonly rev?: string;
 }
 
 /** Where a plugin sits in the operator's mental model, and its default state. */
@@ -233,10 +200,6 @@ export function manifestOf(plugin: AnyPlugin): PluginManifest {
     title: pluginName(plugin, 'anonymous'),
     description: description ?? '',
     tier: 'standard',
-    // No page unless declared: a plugin with no manifest is usually an embedded
-    // helper or a fixture, and a settings section for each of those would fill
-    // the navigation with pages that answer nothing. Declaring the manifest field
-    // is one line, and it is the plugin's own line to write.
   };
 }
 

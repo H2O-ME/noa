@@ -162,7 +162,6 @@ export const BUILTIN_TOOL_KINDS: Record<string, ToolCallKind> = {
   todo_write: 'plan',
   ask_user_question: 'question',
   subagent: 'subagents',
-  get_time: 'other',
 };
 
 /** Kind of a tool the registry did not declare; `Object.hasOwn` because a name from model output would otherwise resolve to an inherited member. */

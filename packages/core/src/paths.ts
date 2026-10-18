@@ -71,27 +71,29 @@ export function cacheRoot(homedir: string = os.homedir()): string {
 }
 
 /**
+ * `~/.noa/memory/` — the agent's durable notes and the vector index derived
+ * from them.
+ *
+ * Inside the app home, NOT the workspace: memory belongs to the AGENT, not to
+ * whichever project it is pointed at. A workspace switch must not lose it, and
+ * a note must never land in the operator's repository (which is also why this
+ * cannot be a `write` under the workspace root).
+ *
+ * Homedir is resolved at CALL time, never cached: the test harness redirects
+ * `HOME`/`USERPROFILE` per suite, so a module-level constant would write into
+ * the real home from every test.
+ */
+export function memoryDir(homedir: string = os.homedir()): string {
+  return path.join(appHome(homedir), 'memory');
+}
+
+/**
  * Tool-output spill root — `~/.noa/cache/tool-outputs/` (the trusted read
  * root exemption) or, with `sessionId`, that session's own group dir.
  */
 export function toolOutputsDir(sessionId?: string, homedir: string = os.homedir()): string {
   const root = path.join(cacheRoot(homedir), 'tool-outputs');
   return sessionId === undefined ? root : path.join(root, sessionId);
-}
-
-/** Web surface stores: the last bound port (origin survives restarts) and the
- * launch pairing (cookies outlive the process — a PWA needs no URL token). */
-export function webPortStorePath(homedir: string = os.homedir()): string {
-  return path.join(cacheRoot(homedir), 'web-port.json');
-}
-
-export function webAuthStorePath(homedir: string = os.homedir()): string {
-  return path.join(cacheRoot(homedir), 'web-auth.json');
-}
-
-/** models.dev catalog cache: `~/.noa/cache/models-dev.json` — the sole definition. */
-export function modelsDevStorePath(homedir: string = os.homedir()): string {
-  return path.join(cacheRoot(homedir), 'models-dev.json');
 }
 
 /*

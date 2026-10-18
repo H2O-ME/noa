@@ -99,10 +99,9 @@ export interface AgentSurfaceRuntime {
  *
  * What is NOT here is as deliberate: no execution mode, no model seat, no
  * workspace-provider vocabulary. Which code modes exist is one plugin's business
- * and its settings live in its own config row, so a surface that wants to show or
- * change one asks for a plugin operation (`pluginRpc`), not for a kernel member
- * named after that plugin. A member here would be core holding one plugin's
- * vocabulary in the contract every surface must implement.
+ * and its settings live in its own config row, so a surface never needs a kernel
+ * member named after that plugin. A member here would be core holding one
+ * plugin's vocabulary in the contract every surface must implement.
  */
 /**
  * One plugin row as `AgentSurfaceKernel.roster()` reports it — the structural

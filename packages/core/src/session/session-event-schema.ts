@@ -30,6 +30,11 @@ export function validateEvent(value: unknown): SessionEvent | undefined {
     case 'compaction/end':
     case 'goal/change':
       return isNumber(value['at']) ? (value as SessionEvent) : undefined;
+    case 'rewind':
+      // `keepIds` is a list of message IDS (unlike the summary's positional
+      // `keep`). An EMPTY list is legitimate — a rewind down to nothing but
+      // scaffolding — so it must be accepted rather than read as a missing field.
+      return isStringList(value['keepIds']) && isNumber(value['at']) ? (value as SessionEvent) : undefined;
     case 'todo/write':
       return Array.isArray(value['todos']) && isNumber(value['at']) ? (value as SessionEvent) : undefined;
     case 'approval':
@@ -74,4 +79,8 @@ function isNumber(value: unknown): boolean {
 
 function isIndexList(value: unknown): boolean {
   return Array.isArray(value) && value.every(isNumber);
+}
+
+function isStringList(value: unknown): boolean {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
 }

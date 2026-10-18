@@ -87,8 +87,14 @@ export function buildContextFragment(
  */
 export const CONTEXT_FRAGMENT_ID_PREFIX = 'msg_ctx_';
 
-/** True for the session-start context fragment produced by buildContextFragment. */
-export function isContextFragment(msg: AgentMessage): boolean {
+/**
+ * True for the session-start context fragment produced by buildContextFragment.
+ *
+ * Takes the three fields it reads rather than a whole `AgentMessage`, so a
+ * reader that only has a decoded log record (the memory indexer, which walks
+ * raw JSONL) can ask the question without rebuilding a message it never had.
+ */
+export function isContextFragment(msg: Pick<AgentMessage, 'role' | 'id' | 'content'>): boolean {
   return (
     msg.role === 'user' &&
     (msg.id.startsWith(CONTEXT_FRAGMENT_ID_PREFIX) || msg.content.startsWith('<environment>'))

@@ -14,7 +14,17 @@ import { hasControlChars } from './text.js';
 import type { ToolCall, ToolPermissionKind } from './types.js';
 import type { ToolCallView } from './presentation.js';
 
-export type ApprovalMode = 'read-only' | 'auto-edit' | 'full';
+/**
+ * The two permission tiers.
+ *
+ *  - `auto`: reads, in-workspace writes and network READS are auto-allowed;
+ *    everything else (execute, out-of-workspace reads) goes to the interactive
+ *    gate — which in this product is the SMART one (a reviewer model first, a
+ *    human only when the reviewer is unsure). See plugins' `reviewer.ts`, and
+ *    `PermissionService.autoAllows` for why a network read is not gated.
+ *  - `full`: everything is allowed; nothing is asked.
+ */
+export type ApprovalMode = 'full' | 'auto';
 export type AskAnswer = 'allow' | 'deny' | 'always';
 /**
  * An "always" answer carrying an explicit grant scope: the answerer may pin
@@ -154,10 +164,10 @@ export interface ApprovalAudit {
  * `mode` and `policy` are deliberately NOT the same kind of fact, and separating
  * them is what makes a remote peer safe:
  *
- *  - `approvalMode` (read-only / auto-edit / full) and the remembered grants
- *    behind it belong to ONE conversation, so a session owns them. A peer that
- *    raises its tier must not raise anybody else's — which is why the engine is
- *    per session and the decision is routed by `ToolCallScope.sessionId`.
+ *  - `approvalMode` (auto / full) and the remembered grants behind it belong to
+ *    ONE conversation, so a session owns them. A peer that raises its tier must
+ *    not raise anybody else's — which is why the engine is per session and the
+ *    decision is routed by `ToolCallScope.sessionId`.
  *  - `approvalPolicy` ('ask' | 'never') is a property of the PROCESS: it says
  *    whether an interactive answerer exists at all. A headless runner pins it
  *    once and every session it creates inherits that, because there is no human

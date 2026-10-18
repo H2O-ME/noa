@@ -11,8 +11,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { admitsOnlyRaster, pngBytes } from './helpers/image-bytes.js';
-import { acceptsImages, imageOmittedText, sniffImageMediaType } from '../src/images.js';
-import { admitImage, imageDigest, readImage } from '../src/image-store.js';
+import { acceptsImages, imageOmittedText, imagePolicy, imageUnverifiedText, sniffImageMediaType } from '../src/images.js';
+import { admitImage, imageDigest, imagePath, readImage } from '../src/image-store.js';
 import { projectRequestImages } from '../src/image-projection.js';
 import type { ImageAttachmentRef, UserMessage } from '../src/index.js';
 
@@ -62,6 +62,20 @@ describe('acceptsImages', () => {
     expect(acceptsImages(['text', 'image'])).toBe(true);
     expect(acceptsImages(['text'])).toBe(false);
     expect(acceptsImages(['text', 'video'])).toBe(false);
+  });
+
+  it('keeps the third state distinct from a declared yes', () => {
+    // The projection needs all three: a declared yes sends the bytes silently,
+    // "unknown" sends them WITH a note (a gateway can drop them and still answer
+    // 200), and a declared no does not send them at all.
+    expect(imagePolicy(undefined)).toBe('inline-unverified');
+    expect(imagePolicy(['text', 'image'])).toBe('inline');
+    expect(imagePolicy(['text'])).toBe('omit');
+    // The binary helper is the binary reading of the same decision, not a second
+    // implementation of it.
+    for (const modalities of [undefined, ['text'], ['text', 'image']] as const) {
+      expect(acceptsImages(modalities)).toBe(imagePolicy(modalities) !== 'omit');
+    }
   });
 });
 
@@ -196,6 +210,66 @@ describe('projectRequestImages', () => {
     expect(message.role === 'user' && message.resolvedImages).toBeUndefined();
   });
 
+  it('sends bytes AND names the path when the capability is unknown', async () => {
+    // The observed field failure: a gateway that ignores image parts answers 200
+    // with the same prompt_tokens as a request carrying no image, so nothing in
+    // this process can tell "the model saw it" from "the model was handed a
+    // question about nothing". The model then explained the gap by inventing
+    // capabilities. The note gives it something true to say instead.
+    const admitted = await admitImage(pngBytes(), 'shot.png', home);
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    const projected = await projectRequestImages(
+      [userMessage('帮我转文字', [admitted.ref])],
+      () => Promise.resolve(undefined),
+      home,
+    );
+    const message = projected.messages[0];
+    expect(message.role).toBe('user');
+    if (message.role !== 'user') return;
+    // The bytes still go: an undeclared model may well be a vision model.
+    expect(message.resolvedImages).toHaveLength(1);
+    // ...and the path goes with them.
+    expect(message.content).toContain('帮我转文字');
+    expect(message.content).toContain(imagePath(admitted.ref, home));
+    expect(message.content).toContain('say so plainly');
+    // Not the capability placeholder: this model was never declared blind.
+    expect(message.content).not.toContain('text only');
+  });
+
+  it('adds no note at all when the model DECLARED it takes images', async () => {
+    // The note exists to cover an unconfirmable send; a confirmed one needs none,
+    // and a needless line in every prompt is a cost with no reader.
+    const admitted = await admitImage(pngBytes(), 'shot.png', home);
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    const projected = await projectRequestImages(
+      [userMessage('look', [admitted.ref])],
+      () => Promise.resolve(['text', 'image']),
+      home,
+    );
+    const message = projected.messages[0];
+    expect(message.role === 'user' && message.content).toBe('look');
+  });
+
+  it('gives a text-only model the file PATH, not just an apology', async () => {
+    // Told only "an image was withheld" the model can do nothing but apologise;
+    // told where the file is, it can say where the attachment went.
+    const admitted = await admitImage(pngBytes(), 'cat.png', home);
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    const projected = await projectRequestImages(
+      [userMessage('what is this?', [admitted.ref])],
+      () => Promise.resolve(['text']),
+      home,
+    );
+    const message = projected.messages[0];
+    expect(message.role).toBe('user');
+    if (message.role !== 'user') return;
+    expect(message.content).toContain(imagePath(admitted.ref, home));
+    expect(message.content).not.toContain('sha256:');
+  });
+
   it('names an image whose bytes are gone rather than failing the turn', async () => {
     // One lost image must not make an otherwise valid conversation unsendable.
     const ghost: ImageAttachmentRef = { id: `sha256:${'a'.repeat(64)}`, mediaType: 'image/png', bytes: 10 };
@@ -306,10 +380,34 @@ describe('imageOmittedText', () => {
     expect(text).not.toContain('b'.repeat(64));
   });
 
+  it('prefers the path over the digest when the caller can give one', () => {
+    // The path is actionable and the digest is not, so when both are available
+    // only the path is worth the tokens.
+    const ref: ImageAttachmentRef = { id: 'sha256:abcd1234', mediaType: 'image/png', bytes: 1 };
+    const text = imageOmittedText(ref, '/home/me/.noa/cache/images/abcd1234');
+    expect(text).toContain('/home/me/.noa/cache/images/abcd1234');
+    expect(text).not.toContain('sha256:');
+  });
+
   it('reads sensibly with no name', () => {
     const text = imageOmittedText({ id: 'sha256:abcd1234', mediaType: 'image/png', bytes: 1 });
     expect(text).toContain('omitted');
     expect(text).toContain('abcd1234');
+  });
+});
+
+describe('imageUnverifiedText', () => {
+  it('asks for an honest admission instead of a guess', () => {
+    const text = imageUnverifiedText(
+      { id: 'sha256:abcd1234', mediaType: 'image/png', bytes: 1, name: 'shot.png' },
+      '/tmp/images/abcd1234',
+    );
+    expect(text).toContain('shot.png');
+    expect(text).toContain('/tmp/images/abcd1234');
+    expect(text).toContain('cannot see it');
+    // It must not blame the model's capabilities: nothing declared it blind, and
+    // a false claim here would be repeated by every later turn.
+    expect(text).not.toContain('text only');
   });
 });
 

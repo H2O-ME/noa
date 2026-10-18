@@ -18,12 +18,6 @@
 export { Context } from './context.js';
 export { registerCommand, registerTool } from './registration.js';
 export { objectConfig, type ConfigFieldSpec, type ConfigFieldType } from './schema.js';
-export {
-  type PluginPageDescriptor,
-  type PluginSettingAction,
-  type PluginSettingField,
-  type PluginSettingStatus,
-} from './settings-page.js';
 export { Fiber, type FiberState, type Runtime } from './fiber.js';
 export { PluginLoader, type PluginEntry, type PluginEntryOptions } from './loader.js';
 export { EventRegistry, event, isBailed, type EventKey, type Listener, type Next, type OnOptions } from './events.js';
@@ -49,7 +43,6 @@ export {
   type Dispose,
   type Plugin,
   type PluginBase,
-  type PluginClientBundle,
   type PluginConstructor,
   type PluginFunction,
   type PluginManifest,
@@ -68,14 +61,13 @@ export {
   beforeTurnEnd,
   commands,
   compaction,
-  contextInsights,
   executionEnvironment,
   jobs,
   llm,
   loader,
+  modelControl,
+  modelDefaults,
   pluginConfig,
-  pluginRpc,
-  routes,
   sessions,
   shell,
   skills,
@@ -91,11 +83,8 @@ export {
   type CompactionService,
   type ExecutionEnvironment,
   type LlmService,
+  type ModelDefaultsPort,
   type PluginConfigPort,
-  type PluginRoute,
-  type PluginRouteHandler,
-  type PluginRpc,
-  type RouteRegistry,
   type ShellService,
   type SessionOpenOptions,
   type SessionService,

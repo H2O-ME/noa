@@ -6,7 +6,6 @@ import {
   TURN_ABORTED_GUIDANCE,
   LENGTH_CUTOFF_TOOL_GUIDANCE,
   JobRegistry,
-  getTimeTool,
   runAgent,
   type AgentEvent,
   type AgentMessage,
@@ -18,6 +17,7 @@ import {
   type UserMessage,
 } from '../src/index.js';
 import { scriptedProvider, collect } from './helpers/scripted-provider.js';
+import { getTimeTool } from './helpers/tool-fixture.js';
 
 describe('runAgent', () => {
   it('streams a plain text answer and records usage', async () => {
@@ -311,7 +311,32 @@ describe('runAgent', () => {
     const messages: AgentMessage[] = [];
     await collect(runAgent({ provider, messages, rootDir: '.' }));
     const toolResult = messages.find((m): m is ToolResultMessage => m.role === 'tool');
-    expect(toolResult?.content).toBe('Error: unknown tool "nope"');
+    // 报错要带上真实存在的工具名：只报 unknown tool，模型就没有纠正依据，会自己
+    // 编解释（实测：它对用户说「这个环境里记忆检索功能不可用」，而事实是那次部署
+    // 没启用那个插件）。空注册表也要给出可读的一句。
+    expect(toolResult?.content).toBe('Error: unknown tool "nope". Available tools: ');
+  });
+
+  it('names the tools that DO exist when a call misses', async () => {
+    // 这是那句话的用处：模型据此当场改用别的工具，或如实说明「这次部署没启用那个
+    // 插件」，而不是向用户编一句「功能坏了」。
+    const provider = scriptedProvider([
+      [
+        { type: 'tool_call_delta', index: 0, id: 'c1', name: 'recall', argsDelta: '{}' },
+        { type: 'finish', finishReason: 'tool_calls' },
+      ],
+      [{ type: 'text_delta', text: 'ack' }, { type: 'finish', finishReason: 'stop' }],
+    ]);
+    const messages: AgentMessage[] = [];
+    const named = (name: string): ToolDefinition => ({
+      name,
+      description: name,
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      execute: () => name,
+    });
+    await collect(runAgent({ provider, messages, rootDir: '.', tools: [named('bash'), named('read_file')] }));
+    const toolResult = messages.find((m): m is ToolResultMessage => m.role === 'tool');
+    expect(toolResult?.content).toBe('Error: unknown tool "recall". Available tools: bash, read_file');
   });
 
   it('offloads oversized tool results to disk and keeps a reference', async () => {

@@ -374,4 +374,32 @@ describe('session log read purity and shape tolerance', () => {
     expect(reopened.deriveMessages().map((m) => m.id)).toEqual(['msg_u1', 'msg_u2']);
     expect(reopened.warnings.length).toBeGreaterThan(0);
   });
+
+  it('admits a rewind, including one that keeps nothing', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'nova-sess-rewind-'));
+    const session = await Session.create(dir, 'sess_rewind');
+    await session.append(user('msg_u1', 'hi'));
+    await session.append(user('msg_u2', 'again'));
+    // An EMPTY keepIds is the legitimate "drop everything" rewind, so it must not
+    // read as a missing field — that would make an `/undo` down to the scaffolding
+    // silently non-durable.
+    await session.appendEvent({ type: 'rewind', keepIds: [], at: Date.now() });
+
+    const reopened = await Session.open(session.file);
+    expect(reopened.warnings).toEqual([]);
+    expect(reopened.deriveMessages()).toEqual([]);
+  });
+
+  it('skips a rewind line whose keepIds is not a list of strings', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'nova-sess-rewind-bad-'));
+    const session = await Session.create(dir, 'sess_rewind_bad');
+    await session.append(user('msg_u1', 'hi'));
+    await appendFile(session.file, `${JSON.stringify({ type: 'rewind', keepIds: [1, 2], at: 1 })}\n`, 'utf8');
+
+    const reopened = await Session.open(session.file);
+    // The bad frame is dropped, so the surface keeps the message it would have
+    // shadowed: losing a turn to a corrupt line is worse than ignoring the line.
+    expect(reopened.deriveMessages().map((m) => m.id)).toEqual(['msg_u1']);
+    expect(reopened.warnings.length).toBeGreaterThan(0);
+  });
 });

@@ -31,6 +31,26 @@ function objectPath(id: string, homedir?: string): string {
   return path.join(imagesDir(homedir), id.replace('sha256:', ''));
 }
 
+/**
+ * Where one reference's bytes live on disk.
+ *
+ * Exported because a request sometimes has to tell the model WHERE an image is
+ * instead of handing it the bytes — a model that cannot accept images still
+ * deserves to know an attachment arrived and where it went (see
+ * `imageOmittedText`). Only this module knows how the store lays out, so the
+ * path is spelled here rather than re-derived by every caller.
+ *
+ * The directory is deliberately NOT a trusted read root (see the module head):
+ * naming a path is for the model's own account of the turn, not a promise that
+ * `read_file` will open it.
+ * @param ref - the stored reference.
+ * @param homedir - override for tests.
+ * @returns the absolute path of the object.
+ */
+export function imagePath(ref: ImageAttachmentRef, homedir?: string): string {
+  return objectPath(ref.id, homedir);
+}
+
 /** Hex digest of some bytes, in the `sha256:<hex>` form references use. */
 export function imageDigest(bytes: Uint8Array): string {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;

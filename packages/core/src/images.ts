@@ -92,18 +92,53 @@ export function sniffImageMediaType(bytes: Uint8Array): ImageMediaType | undefin
 }
 
 /**
- * Whether one model's declared input modalities allow native image content.
+ * What to do with an image, given the model's declared input modalities.
  *
- * An ABSENT declaration means YES, not no: the modalities table is a
+ * Three states, not two, because the two ways of "sending it" are not equally
+ * trustworthy:
+ *
+ *  - `inline` — the model DECLARED it takes images. Send the bytes and say
+ *    nothing extra; the picture is the message.
+ *  - `inline-unverified` — nobody declared anything (see {@link acceptsImages}).
+ *    Send the bytes, and ALSO name the file's path, because this is the one case
+ *    where the request can silently fail: a gateway that does not support image
+ *    parts may drop them and return 200 anyway, leaving the model with a question
+ *    about a picture it was never given. Observed in the field — the model then
+ *    answered as if no attachment had arrived and invented capabilities to
+ *    explain it. Naming the path costs one line and gives the model something
+ *    true to say instead.
+ *  - `omit` — the model DECLARED text only. The bytes are not sent at all, and
+ *    the path is the whole of what the model gets.
+ */
+export type ImagePolicy = 'inline' | 'inline-unverified' | 'omit';
+
+/**
+ * The policy for one model's declared input modalities.
+ *
+ * An ABSENT declaration means SEND IT, not "do not": the modalities table is a
  * third-party lookup that fails to resolve perfectly ordinary gateway aliases,
  * and treating "we could not find out" as "this model is blind" would silently
  * downgrade a perfectly capable vision model. The declared-negative case is the
- * only one worth acting on.
+ * only one worth acting on — hence `inline-unverified` rather than `omit`.
+ * @param inputModalities - the resolved declaration, when one exists.
+ * @returns what to do with an image.
+ */
+export function imagePolicy(inputModalities: readonly string[] | undefined): ImagePolicy {
+  if (inputModalities === undefined) return 'inline-unverified';
+  return inputModalities.includes('image') ? 'inline' : 'omit';
+}
+
+/**
+ * Whether one model's declared input modalities allow native image content.
+ *
+ * The binary reading of {@link imagePolicy}, for callers that only need to know
+ * whether the bytes go out — the projection needs the third state, because it
+ * also has to decide what to SAY.
  * @param inputModalities - the resolved declaration, when one exists.
  * @returns whether image bytes may be sent natively.
  */
 export function acceptsImages(inputModalities: readonly string[] | undefined): boolean {
-  return inputModalities === undefined || inputModalities.includes('image');
+  return imagePolicy(inputModalities) !== 'omit';
 }
 
 /**
@@ -112,11 +147,35 @@ export function acceptsImages(inputModalities: readonly string[] | undefined): b
  * The model is told an image existed and was withheld, rather than being handed
  * a silently empty turn — a model that cannot see the image can still say so,
  * and the user learns the model is the reason.
+ *
+ * The path is included because the alternative is a dead end: told only "an
+ * image was withheld", the model can do nothing but apologise. Told where the
+ * file is, it can say where the attachment went, and a tool that can read files
+ * has something to work with.
  * @param ref - the withheld image.
- * @returns a stable placeholder naming the image and its digest.
+ * @param path - where its bytes live, when the caller can say.
+ * @returns a stable placeholder naming the image and its location.
  */
-export function imageOmittedText(ref: ImageAttachmentRef): string {
-  return `[image${imageLabel(ref)} omitted because this model accepts text only; attachment ${shortDigest(ref)}]`;
+export function imageOmittedText(ref: ImageAttachmentRef, path?: string): string {
+  const where = path === undefined ? `attachment ${shortDigest(ref)}` : `saved at ${path}`;
+  return `[image${imageLabel(ref)} omitted because this model accepts text only; ${where}]`;
+}
+
+/**
+ * The text appended to an image whose acceptance could not be CONFIRMED.
+ *
+ * Sent alongside the bytes, never instead of them. It exists because the
+ * failure it guards against is invisible from here: a gateway that ignores
+ * image parts answers 200, so nothing in this process can tell "the model saw
+ * it" from "the model was handed a question about nothing". Naming the path and
+ * asking for a plain admission is the only signal available.
+ * @param ref - the image being sent.
+ * @param path - where its bytes live.
+ * @returns the one-line note appended after the user's own words.
+ */
+export function imageUnverifiedText(ref: ImageAttachmentRef, path: string): string {
+  return `[image${imageLabel(ref)} is attached above and also saved at ${path}; `
+    + 'if you cannot see it, say so plainly instead of guessing at its contents]';
 }
 
 /**
@@ -126,7 +185,8 @@ export function imageOmittedText(ref: ImageAttachmentRef): string {
  * model must not be told otherwise: here the model COULD have accepted the
  * image, so blaming its capabilities would write a false statement into the
  * transcript that every later turn repeats. "No longer available" is the honest
- * claim, and it tells the reader that re-attaching would work.
+ * claim, and it tells the reader that re-attaching would work. No path here on
+ * purpose: the file is gone, so naming a location would be a second false claim.
  * @param ref - the lost image.
  * @returns a stable placeholder naming the image and its digest.
  */

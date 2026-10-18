@@ -46,18 +46,37 @@ export function missingToolResults(messages: readonly AgentMessage[]): ToolResul
 }
 
 /**
- * Repair an abandoned turn's LOG (assistant tool_calls without results):
- * synthesize the missing results into the log and fill any hole left in the
- * live surface. Idempotent (it scans the log), so it is safe to run even when
- * the run loop's own surface cleanup already fired.
+ * Repair an abandoned turn (assistant tool_calls without results): synthesize the
+ * missing results into the log and fill any hole left in the live surface.
+ * Idempotent, so it is safe to run even when the run loop's own surface cleanup
+ * already fired.
+ *
+ * The candidates come from the LOG (`session.allMessages()`), not from the
+ * surface, and that is load-bearing: the run loop's own cleanup (`refuse.ts`)
+ * fills the surface IN MEMORY, so by the time this runs the surface may already
+ * look whole while the durable file still carries a bare call — and a resume
+ * projects from the file. Repairing from the surface would leave the log
+ * dangling forever.
+ *
+ * Filtered to the calls the SURFACE still carries, which is what makes the log
+ * scope safe once a surface can be a strict SUBSET of the log: after a compaction
+ * or a `/undo`, a dangling call in the shadowed part needs no result, and
+ * appending one would land an ORPHAN tool message on the current surface —
+ * precisely the unbalanced shape this file exists to prevent.
+ * @param session - the log to append synthesized results to.
+ * @param messages - the live model surface.
+ * @returns how many results were synthesized.
  */
 export async function persistMissingToolResults(
   session: Session,
   messages: AgentMessage[],
 ): Promise<number> {
-  // `missingToolResults` computes the logged set itself; a second copy here
-  // would be one more thing to keep in step with it (and was never read).
-  const missing = missingToolResults(session.allMessages());
+  const onSurface = new Set<string>();
+  for (const msg of messages) {
+    if (msg.role !== 'assistant' || msg.toolCalls === undefined) continue;
+    for (const call of msg.toolCalls) onSurface.add(call.id);
+  }
+  const missing = missingToolResults(session.allMessages()).filter((result) => onSurface.has(result.toolCallId));
   if (missing.length === 0) return 0;
   const surfaceResults = new Set<string>();
   for (const msg of messages) {

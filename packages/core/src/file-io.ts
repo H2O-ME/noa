@@ -206,8 +206,20 @@ export async function createEntry(
   return { path: target };
 }
 
-/** Same-dir tmp + atomic rename; carries the replaced file's mode over. */
-async function atomicWrite(file: string, content: string): Promise<void> {
+/**
+ * Same-dir tmp + atomic rename; carries the replaced file's mode over.
+ *
+ * Exported for writers whose target is NOT inside a workspace root — a plugin
+ * maintaining its own store under `~/.noa`, say. `writeTextFile` stays the
+ * root-constrained door for the MODEL's writes and is what tools use; this is
+ * the mechanism underneath it, published because a second copy of
+ * temp-file-then-rename is how that discipline drifts. It confers no privilege a
+ * plugin did not already have: a plugin is in-process code with `node:fs` in
+ * reach, and this only removes the reason to hand-roll it.
+ * @param file - the ABSOLUTE target path; the caller owns path resolution.
+ * @param content - the text to write.
+ */
+export async function atomicWrite(file: string, content: string): Promise<void> {
   const dir = path.dirname(file);
   await mkdir(dir, { recursive: true });
   const tmp = path.join(dir, `.noa-tmp-${process.pid}-${(Math.random() * 2 ** 32).toString(36)}`);

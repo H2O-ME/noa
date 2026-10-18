@@ -33,6 +33,13 @@ export type NoticeCode =
   | 'compact_fused'
   /** A plugin hook replaced the messages array, so in-place compaction was disarmed. */
   | 'compact_alias_broken'
+  /**
+   * A `/undo` (or `/retry`) left the live surface and the log projection
+   * disagreeing — the same aliasing hazard as `compact_alias_broken`, and the one
+   * thing a rewind must never do silently: a restart would resurrect the very
+   * turns that were just taken back.
+   */
+  | 'rewind_alias_broken'
   /** An automatic compaction attempt threw (run continues uncompressed). */
   | 'compact_failed'
   /** A surface's event consumer fell behind MAX_LAG and its window was reset. */

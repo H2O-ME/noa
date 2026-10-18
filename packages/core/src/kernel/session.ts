@@ -36,6 +36,7 @@ import type { JobRegistry } from '../jobs.js';
 import type { JobSnapshot } from '../job-types.js';
 import type { QuestionBroker, QuestionRequest, AskUserQuestionAnswer } from '../user-question.js';
 import type { Session, SessionEvent } from '../session.js';
+import { applyRewind, planTurnRewind, type TurnRewind } from '../session.js';
 import { isContextFragment } from '../context-fragment.js';
 import { recordSessionTitle, sessionTitleOf } from '../session/session-title.js';
 import { generateSessionTitle, titleTranscript, TITLE_REGEN_PROMPTS } from './title.js';
@@ -583,6 +584,49 @@ export class AgentSession {
     // has no run loop around it.
     if (!this.running && !this.closed && !this.pending.empty) void this.runLoop();
     return outcome;
+  }
+
+  /**
+   * Take back the last `turns` turns (`/undo`, `/retry`).
+   *
+   * A REWIND, not a deletion: the event is appended and the surface is
+   * re-projected without those turns, so the log keeps what actually happened
+   * while the model stops seeing it. Three effects, together, exactly as
+   * `commitCompaction` groups its own — and for the same reason: the surface is
+   * spliced IN PLACE (every consumer holds that array), the token anchors are
+   * reset (the old measurement described a surface that no longer exists, and
+   * the kept prefix's size is not knowable from here), and the durable event is
+   * written.
+   *
+   * The cut lands on a TURN BOUNDARY (`planTurnRewind`), which is what keeps the
+   * result balanced: a tool result never outlives the assistant message that
+   * asked for it.
+   *
+   * Refuses while a run is in flight — the same refusal `compact()` makes, for
+   * the same reason: splicing the array under a live request corrupts it. The
+   * channel serializes its turns, so a peer's `/undo` never hits this; a second
+   * caller must handle it rather than assume it away.
+   * @param turns - how many turns to drop; clamped to what the surface holds.
+   * @returns the cut (what survives, how much went, and the dropped turn's
+   *   prompt), or undefined when there was no turn to drop.
+   * @throws when a run is active.
+   */
+  async rewindTurns(turns = 1): Promise<TurnRewind | undefined> {
+    if (this.running) throw new Error('会话正在跑一轮，现在不能回退（先 /stop 或等这一轮结束）');
+    const plan = planTurnRewind(this.deps.messages, turns);
+    if (plan === undefined) return undefined;
+    await this.deps.session.appendEvent({ type: 'rewind', keepIds: plan.keepIds, at: Date.now() });
+    const messages = this.deps.messages;
+    messages.splice(0, messages.length, ...applyRewind(messages, plan.keepIds));
+    resetAnchors(this.anchors);
+    // Checked at the second moment the invariant can break (the first is a
+    // compaction): the live surface and the replayed projection must agree, or
+    // a restart would silently resurrect the turns that were just taken back.
+    const divergence = surfaceDivergence(this.deps.session, messages);
+    if (divergence !== undefined) {
+      this.notice('rewind_alias_broken', `回退后模型面与日志投影不一致：${divergence}`);
+    }
+    return plan;
   }
 
   /**

@@ -92,7 +92,7 @@ export async function peekSession(file: string): Promise<SessionPeek> {
       // The same rule the full projection applies, shared so the head scan and
       // the loaded session cannot disagree. Stricter than "starts with <", so a
       // prompt opening with a bracket is still a prompt.
-      if (isContextFragment({ id: typeof msg.id === 'string' ? msg.id : '', ts: 0, role: 'user', content })) {
+      if (isContextFragment({ id: typeof msg.id === 'string' ? msg.id : '', role: 'user', content })) {
         const cwd = /^cwd=(.+)$/m.exec(content)?.[1]?.trim();
         if (cwd !== undefined && workspace === undefined) workspace = cwd;
         continue;

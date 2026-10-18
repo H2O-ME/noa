@@ -111,3 +111,28 @@ export function findOrphanCompaction(events: SessionEvent[]): number {
   }
   return open;
 }
+
+/**
+ * The ONE implementation of "surface after this rewind" = the surface minus
+ * everything the rewind did not name.
+ *
+ * Shared by the live path (`AgentSession.rewindTurns`) and the replay projection
+ * (`Session.deriveMessages`) for the same reason `compactionSurface` is shared: a
+ * live splice and a replayed projection that disagreed would make the surface
+ * depend on whether the process had restarted — and the divergence check would
+ * then fire on the honest path.
+ *
+ * Resolution is against the CURRENT surface rather than the whole message stream,
+ * which is what makes a rewind compose with a compaction: the surface may hold a
+ * SYNTHESIZED summary message that no `message` event carries, and resolving
+ * against the log would silently drop it. SURFACE order is preserved (a rewind
+ * says "drop these", not "reorder into these"), and an id the surface does not
+ * hold is absent from both sides rather than an error.
+ * @param surface - the surface in force.
+ * @param keepIds - the message ids that survive.
+ * @returns the surviving messages, in their original order.
+ */
+export function applyRewind(surface: readonly AgentMessage[], keepIds: readonly string[]): AgentMessage[] {
+  const kept = new Set(keepIds);
+  return surface.filter((msg) => kept.has(msg.id));
+}

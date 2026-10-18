@@ -70,6 +70,53 @@ export interface LlmService {
 
 export const llm: ServiceKey<LlmService> = key<LlmService>('llm');
 
+/* ── model control ─────────────────────────────────────────────────────── */
+
+/**
+ * The model SWITCHING seat, as a plugin sees it.
+ *
+ * Published only when the assembly was handed a `ModelCatalogPort` (see
+ * `CreateKernelOptions`), because the seat's whole job is to answer "which ids
+ * may I pick, and how do they render" — with no catalog there is no picker to
+ * drive, and an ABSENT service is how a consumer learns that (`ctx.get`).
+ *
+ * A channel needs it for `/model`: the ids come from the endpoint, the metadata
+ * from the surface, and the switch retargets the ONE client instance every
+ * consumer already holds before announcing it on the kernel event stream. Doing
+ * that in the channel instead would be a second implementation of the same three
+ * steps, and the second one is always the one that forgets to announce.
+ */
+export const modelControl: ServiceKey<import('../kernel/model-control.js').ModelControl> =
+  key<import('../kernel/model-control.js').ModelControl>('model-control');
+
+/**
+ * Writing a model down as this deployment's DEFAULT — the persistence half of
+ * `/model`, and a different authority from the switch above.
+ *
+ * Switching retargets a running client; this rewrites the deployment's own config
+ * so the next process starts there. Separate seams because they exist
+ * independently: a headless runner switches nothing while its config is still the
+ * operator's, and a process may hold a switchable client with no writable config
+ * at all. Absent = "this deployment has nowhere to write it", which `/model
+ * default` must report rather than pretend to do.
+ */
+export interface ModelDefaultsPort {
+  /** The model the config file names right now, for "switch" vs "default" talk. */
+  configured(): Promise<string | undefined>;
+  /**
+   * Persist one model id as the default.
+   *
+   * MUST NOT overwrite a config it could not parse: an unreadable file is one
+   * whose other settings are unknown, and writing there loses them silently.
+   * Report the refusal instead.
+   * @param model - the id to record.
+   * @returns whether it landed, and why not when it did not.
+   */
+  setDefault(model: string): Promise<{ ok: boolean; reason?: string }>;
+}
+
+export const modelDefaults: ServiceKey<ModelDefaultsPort> = key<ModelDefaultsPort>('model-defaults');
+
 /* ── execution-environment ─────────────────────────────────────────────── */
 
 /**
@@ -101,27 +148,6 @@ export interface ExecutionEnvironment {
 
 export const executionEnvironment: ServiceKey<ExecutionEnvironment> =
   key<ExecutionEnvironment>('execution-environment');
-
-/* ── plugin-rpc ────────────────────────────────────────────────────────── */
-
-/**
- * Namespaced plugin operations, for the plugins that own a settings page or a
- * runtime status.
- *
- * A plugin registers handlers under its own namespace and gets a disposer, so
- * the operations disappear with its fiber: a switched-off plugin cannot answer,
- * and the host needs no per-plugin request family. The payload stays `unknown`
- * on purpose — the owning plugin is the only thing that knows what its
- * operations mean, so it validates them itself.
- */
-export interface PluginRpc {
-  /** Claim one namespace; the returned disposer releases it (tie it to a fiber). */
-  register(name: string, handler: (op: string, payload: unknown) => Promise<unknown>): import('./types.js').Dispose;
-  /** Run one operation. Throws when no loaded plugin owns the namespace. */
-  invoke(name: string, op: string, payload: unknown): Promise<unknown>;
-}
-
-export const pluginRpc: ServiceKey<PluginRpc> = key<PluginRpc>('plugin-rpc');
 
 /* ── plugin-config ─────────────────────────────────────────────────────── */
 
@@ -463,85 +489,6 @@ export interface SurfaceRows {
   registry: SurfaceRegistry;
   loaded: readonly AgentSurface[];
 }
-
-/* ── context insights ──────────────────────────────────────────────────── */
-
-/**
- * Reading a session's window: what it is made of right now, how it grew request
- * by request, why it changed, and what the run did to the workspace's files.
- *
- * A SERVICE rather than something a surface computes for itself, because the
- * answers cost a walk over the whole session log and are optional: the
- * `context` plugin owns this seam at the `advanced` tier, so an operator who
- * does not want the reading is not paying for it. Its presence IS the switch —
- * a consumer that finds no provider renders nothing, and there is no second
- * flag to keep in step with the roster.
- *
- * Provider usage anchors the reading where usage exists (`prompt` / `cached` /
- * `output` on each point) and the token estimate fills the gaps; a consumer
- * must never present an estimate as a bill.
- */
-export const contextInsights: ServiceKey<import('../context-insights.js').ContextInsights> =
-  key<import('../context-insights.js').ContextInsights>('contextInsights');
-
-/* ── HTTP route registry ──────────────────────────────────────────────── */
-
-/**
- * One HTTP route a plugin has registered. The handler receives the parsed URL
- * and the raw request/response and answers however it likes (a static asset,
- * a JSON payload, a redirect). The host always stands the auth gate in FRONT
- * of plugin routes — a plugin cannot expose an unauthenticated endpoint — and
- * never inspects the response, so plugin responses ride the same origin as the
- * host WebUI behind the host's cookie.
- *
- * `prefix` is matched against the request path's leading characters after the
- * leading slash (`/plugins/<name>/assets` matches every path that starts with
- * it). The first registered prefix that matches wins; the host falls through
- * to its own handlers otherwise.
- */
-export interface PluginRoute {
-  /** Path prefix this route answers, with a leading slash (e.g. `/plugins/genui/assets`). */
-  prefix: string;
-  /** Handler invoked when the prefix matches. */
-  handler: PluginRouteHandler;
-}
-
-/** A route handler answers one HTTP request. */
-export type PluginRouteHandler = (
-  req: import('node:http').IncomingMessage,
-  res: import('node:http').ServerResponse,
-  url: URL,
-) => Promise<void>;
-
-/**
- * The route-registry service a host (the WebUI server today) publishes for
- * plugins to extend. Plugins register prefixes from their `apply(ctx)`; the
- * host queries the registry on each request before falling back to its own
- * handlers. A kernel without a host (exec / qqbot today) does not provide it,
- * so plugins that ship UI capabilities degrade gracefully when run headless.
- */
-export interface RouteRegistry {
-  /**
-   * Append one route. Routes added later in the roster take precedence.
-   * @returns a disposer that removes exactly this registration (by identity).
-   *   Plugins MUST hook it to their own lifetime — `ctx.effect(disposer)` — so
-   *   unloading the plugin retires its routes and their closures; a plugin
-   *   that reloads would otherwise stack same-prefix overrides whose handlers
-   *   outlive the fiber that created them.
-   */
-  register(route: PluginRoute): () => void;
-  /** All currently-registered routes, in registration order. */
-  routes(): readonly PluginRoute[];
-  /**
-   * Resolve a handler for one request path. Returns the FIRST matching route
-   * searching REVERSE registration order, so a plugin loaded later overrides
-   * an earlier plugin's prefix. `undefined` means "no plugin answered" — the
-   * caller falls through to its own handlers.
-   */
-  handlerFor?(pathname: string): PluginRouteHandler | undefined;
-}
-
-export const routes: ServiceKey<RouteRegistry> = key<RouteRegistry>('routes');
 
 /* ── lifecycle events ──────────────────────────────────────────────────── */
 

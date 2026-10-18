@@ -2,7 +2,7 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { newId } from './ids.js';
 import { readEvents, upgradeToV2 } from './session/session-log.js';
-import { compactionSurface, findOrphanCompaction } from './session/session-projection.js';
+import { compactionSurface, applyRewind, findOrphanCompaction } from './session/session-projection.js';
 import type { RunStats } from './kernel/metrics.js';
 import type { AgentMessage } from './types.js';
 import type { Goal } from './goal.js';
@@ -14,12 +14,14 @@ import type { Goal } from './goal.js';
  */
 export {
   anchoredRunStats,
+  applyRewind,
   COMPACT_SUMMARY_PREFIX,
   compactionSummaryMessage,
   compactionSurface,
   findOrphanCompaction,
   parseEventLine,
 } from './session/session-projection.js';
+export { planTurnRewind, type TurnRewind } from './session/session-rewind.js';
 
 /**
  * Session log format v2: the file is an append-only event stream, not a
@@ -64,6 +66,24 @@ export type SessionEvent =
       at: number;
     }
   | { type: 'compaction/end'; at: number; error?: string }
+  /**
+   * A surface REWIND: the last turns were taken back (`/undo`, `/retry`).
+   *
+   * Log-only, and a REPLACEMENT rather than a deletion — the same shape as
+   * `compaction/summary`, for the same reason: the log stays append-only, so the
+   * turns the operator took back are still in the file (what a reader reconstructs
+   * is what actually happened) while the MODEL surface is projected without them.
+   * Deleting them from the file would make the log a lie about the conversation,
+   * and would make a rewind invisible to every audit that reads it.
+   *
+   * `keepIds` names what survives, by ID rather than by position for the reason
+   * `compaction/summary` documents: a corrupt middle line shifts indices, and ids
+   * pin the survivors exactly. It is always a PREFIX of the surface in force —
+   * `planTurnRewind` only ever cuts at a turn boundary, which is what keeps the
+   * result balanced (no tool result outliving the assistant message that asked
+   * for it).
+   */
+  | { type: 'rewind'; keepIds: string[]; at: number }
   /** Log-only durable todo snapshot; never joins the model surface. */
   | { type: 'todo/write'; todos: TodoItem[]; at: number }
   /**
@@ -280,6 +300,13 @@ export class Session {
         // user messages) plus the synthesized summary message — the SAME
         // construction the live compaction path uses (compactionSurface).
         surface = compactionSurface(evt, all, i);
+        continue;
+      }
+      if (evt.type === 'rewind') {
+        // Same class of event as a summary: it REPLACES the surface rather than
+        // adding to it. Applied to the CURRENT surface (not to `all`), so a
+        // summary message the surface synthesizes survives a later rewind.
+        surface = applyRewind(surface, evt.keepIds);
       }
     }
     return surface;

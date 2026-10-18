@@ -23,11 +23,14 @@
  * An UNDECLARED capability counts as accepting (see `acceptsImages`): the
  * modalities table is a third-party lookup that does not resolve every gateway
  * alias, and guessing "blind" from "unknown" would break vision models that
- * work perfectly well.
+ * work perfectly well. But it is a THIRD state, not the same as a declared yes —
+ * an unconfirmed send can fail INVISIBLY (a gateway that ignores image parts
+ * still answers 200), so those images travel with their path attached and a
+ * request to admit blindness rather than guess. See `ImagePolicy`.
  */
-import { acceptsImages, imageLostText, imageOmittedText, type ImageAttachmentRef } from './images.js';
+import { imagePolicy, imageLostText, imageOmittedText, imageUnverifiedText, type ImageAttachmentRef } from './images.js';
 import type { AgentMessage, ResolvedImage } from './types.js';
-import { readImage } from './image-store.js';
+import { imagePath, readImage } from './image-store.js';
 
 /** Read the stored bytes for one reference and encode them for the wire. */
 async function resolveOne(
@@ -73,11 +76,11 @@ export async function projectRequestImages(
   // Asked only now, and asked LIVE: the model may have been switched since the
   // image was attached, and this is the one decision that must follow it.
   const inputModalities = readModalities === undefined ? undefined : await readModalities();
-  const native = acceptsImages(inputModalities);
+  const policy = imagePolicy(inputModalities);
   const missing: ImageAttachmentRef[] = [];
   const resolved = new Map<string, ResolvedImage>();
 
-  if (native) {
+  if (policy !== 'omit') {
     // Resolve each distinct image once even when several messages share it.
     const distinct = new Map<string, ImageAttachmentRef>();
     for (const message of withImages) {
@@ -97,15 +100,18 @@ export async function projectRequestImages(
         return message;
       }
       const { images, ...rest } = message;
-      // Text-only model: every image becomes a placeholder, appended after the
-      // words the user typed so their sentence still reads first.
-      if (!native) {
-        const omitted = images.map(imageOmittedText).join('\n');
+      // Text-only model: every image becomes a placeholder carrying its PATH,
+      // appended after the words the user typed so their sentence still reads
+      // first. The path is what keeps this branch useful — the model cannot see
+      // the picture, but it can say where the attachment went, and a tool that
+      // reads files has somewhere to look.
+      if (policy === 'omit') {
+        const omitted = images.map((ref) => imageOmittedText(ref, imagePath(ref, homedir))).join('\n');
         return { ...rest, content: `${message.content}\n${omitted}` };
       }
-      // Native model: resolved images become content, and anything that failed
-      // to resolve becomes a placeholder rather than silently vanishing — the
-      // model should know an attachment was lost, and so should the caller.
+      // Inline: resolved images become content, and anything that failed to
+      // resolve becomes a placeholder rather than silently vanishing — the model
+      // should know an attachment was lost, and so should the caller.
       const usable: ResolvedImage[] = [];
       const lost: ImageAttachmentRef[] = [];
       for (const ref of images) {
@@ -117,12 +123,20 @@ export async function projectRequestImages(
         const lostText = lost.map(imageLostText).join('\n');
         return { ...rest, content: `${message.content}\n${lostText}` };
       }
+      // The notes are appended in the message's own image order, and only for
+      // images that were really sent: a lost one already has its own line, and
+      // describing it twice would read as two attachments.
+      const notes: string[] = lost.map(imageLostText);
+      if (policy === 'inline-unverified') {
+        for (const ref of images) {
+          if (resolved.get(ref.id) === undefined) continue;
+          notes.push(imageUnverifiedText(ref, imagePath(ref, homedir)));
+        }
+      }
       return {
         ...rest,
         resolvedImages: usable,
-        content: lost.length === 0
-          ? message.content
-          : `${message.content}\n${lost.map(imageLostText).join('\n')}`,
+        content: notes.length === 0 ? message.content : `${message.content}\n${notes.join('\n')}`,
       };
     }),
   };

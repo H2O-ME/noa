@@ -17,7 +17,6 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  getTimeTool,
   runAgent,
   Session,
   type AgentEvent,
@@ -26,6 +25,7 @@ import {
   type StreamEvent,
 } from '@noa/core';
 import { scriptedProvider } from './helpers/scripted-provider.js';
+import { getTimeTool } from './helpers/tool-fixture.js';
 
 describe('save → resume → new turn round-trip', () => {
   it('a resumed session feeds the projected history (user + assistant) into the next request', async () => {

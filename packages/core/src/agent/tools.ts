@@ -259,6 +259,19 @@ export function parseArgs(raw: string): { args: Record<string, unknown>; ok: boo
 }
 
 /**
+ * 「没有这个工具」必须说清**有什么**。
+ *
+ * 只报 `unknown tool "x"`，模型手上就没有任何纠正依据，于是它自己编解释：实测里它据此
+ * 对用户说「这个环境里记忆检索功能（recall）不可用」——读者听到的是「功能坏了」，而事实
+ * 是**这次部署没启用那个插件**（工具名写在系统提示词里，插件却在配置里没开）。把真实
+ * 存在的名字列出来，模型就能当场改用别的工具、或者如实说明「这次部署没开记忆插件」。
+ */
+function unknownToolMessage(name: string, toolByName: Map<string, ToolDefinition>): string {
+  const available = [...toolByName.keys()].sort().join(', ');
+  return `unknown tool "${name}". Available tools: ${available}`;
+}
+
+/**
  * Build the loop's nested-dispatch dispatcher (the PTC seam, dsh
  * run_code-bridge style): a sub-call runs the SAME pipeline as a native one —
  * abort checks, the beforeToolCall gate (permission service + plugin hooks),
@@ -272,7 +285,7 @@ export function makeDispatcher(opts: AgentOptions, toolByName: Map<string, ToolD
   return async (call, signal) => {
     const subOpts = signal !== undefined ? { ...opts, signal } : opts;
     const tool = toolByName.get(call.name);
-    if (tool === undefined) return { ok: false, error: `unknown tool "${call.name}"` };
+    if (tool === undefined) return { ok: false, error: unknownToolMessage(call.name, toolByName) };
     if (subOpts.signal?.aborted) return { ok: false, error: 'run is over; the call was not dispatched' };
     const sub: ToolCall = {
       id: newId('call'),
@@ -283,7 +296,7 @@ export function makeDispatcher(opts: AgentOptions, toolByName: Map<string, ToolD
     const verdict = await preflightToolCall(sub, subOpts);
     if (verdict.kind === 'skip') return { ok: false, error: 'run is over; the call was not dispatched' };
     if (verdict.kind === 'deny') return { ok: false, error: verdict.content };
-    const raw = await executeTool(tool, verdict.effective, subOpts);
+    const raw = await executeTool(toolByName, verdict.effective, subOpts);
     const result = opts.hooks?.afterToolResult
       ? await opts.hooks.afterToolResult(verdict.effective, raw)
       : raw;
@@ -292,12 +305,13 @@ export function makeDispatcher(opts: AgentOptions, toolByName: Map<string, ToolD
 }
 
 async function executeTool(
-  tool: ToolDefinition | undefined,
+  toolByName: Map<string, ToolDefinition>,
   call: ToolCall,
   opts: AgentOptions,
   dispatch?: ToolDispatcher,
 ): Promise<string> {
-  if (!tool) return `Error: unknown tool "${call.name}"`;
+  const tool = toolByName.get(call.name);
+  if (!tool) return `Error: ${unknownToolMessage(call.name, toolByName)}`;
 
   const parent = opts.signal;
   let signal = parent;
@@ -403,7 +417,7 @@ async function completeToolCall(
   toolByName: Map<string, ToolDefinition>,
   dispatch?: ToolDispatcher,
 ): Promise<ToolResultMessage> {
-  let rawResult = await executeTool(toolByName.get(call.name), call, opts, dispatch);
+  let rawResult = await executeTool(toolByName, call, opts, dispatch);
   if (opts.hooks?.afterToolResult) {
     rawResult = await opts.hooks.afterToolResult(call, rawResult);
   }

@@ -3,10 +3,19 @@
  * by a global id set: a provider that reuses a call id in a later turn must
  * still get that later call repaired, or the next request carries an unanswered
  * tool call and a strict provider rejects it.
+ *
+ * The second half is about SCOPE: the durable pass reads its candidates from the
+ * log but only repairs calls the live surface still carries, which is what keeps
+ * a shadowed turn (compacted away, or taken back by `/undo`) from producing an
+ * orphan tool result on the current surface.
  */
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { NOT_EXECUTED_GUIDANCE } from '../src/agent/options.js';
-import { missingToolResults } from '../src/session/session-repair.js';
+import { missingToolResults, persistMissingToolResults } from '../src/session/session-repair.js';
+import { Session } from '../src/session.js';
 import type { AgentMessage } from '../src/types.js';
 
 const assistantCall = (id: string, callId: string): AgentMessage => ({
@@ -59,5 +68,40 @@ describe('missingToolResults', () => {
       },
     ];
     expect(missingToolResults(messages)).toHaveLength(1);
+  });
+});
+
+describe('persistMissingToolResults', () => {
+  async function sessionWith(messages: AgentMessage[]): Promise<Session> {
+    const dir = await mkdtemp(path.join(tmpdir(), 'nova-repair-'));
+    const session = await Session.create(dir, 'sess_repair');
+    for (const msg of messages) await session.append(msg);
+    return session;
+  }
+
+  it('writes a result to the LOG even when the surface already has one in memory', async () => {
+    // The run loop's own cleanup fills the surface; this pass is what makes the
+    // durable file agree. Taking the candidates from the surface instead would
+    // leave the log dangling forever, and a resume projects from the log.
+    const call = assistantCall('a1', 'c1');
+    const session = await sessionWith([call]);
+    const surface = [call, toolResult('t1', 'c1')];
+    expect(await persistMissingToolResults(session, surface)).toBe(1);
+    expect(session.allMessages().some((m) => m.role === 'tool' && m.toolCallId === 'c1')).toBe(true);
+  });
+
+  it('leaves a shadowed turn alone, so its result cannot become an orphan', async () => {
+    // After a compaction or a `/undo` the surface is a strict SUBSET of the log. A
+    // dangling call in the shadowed part needs no result — appending one would
+    // land an orphan tool message on the CURRENT surface, which is the unbalanced
+    // shape this module exists to prevent.
+    const shadowed = assistantCall('a_shadowed', 'c_shadowed');
+    const live = assistantCall('a_live', 'c_live');
+    const session = await sessionWith([shadowed, live]);
+    const surface = [live, toolResult('t_live', 'c_live')];
+    // The live call's result is still written (the log never received the one the
+    // run loop synthesized); the shadowed one is NOT, and that is the assertion.
+    expect(await persistMissingToolResults(session, surface)).toBe(1);
+    expect(session.allMessages().some((m) => m.toolCallId === 'c_shadowed')).toBe(false);
   });
 });
