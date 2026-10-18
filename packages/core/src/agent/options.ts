@@ -70,6 +70,20 @@ export interface AgentOptions {
    * drawn on another tool's row.
    */
   onToolProgress?: (call: ToolCall, text: string) => void;
+  /**
+   * Called by the loop at the one point where appending a user message to
+   * `messages` is always wire-legal: immediately before a request is assembled.
+   *
+   * A mid-run message (see `AgentSession.interject`) must NOT be pushed when it
+   * arrives. `runToolCalls` pushes a batch's tool results one at a time with
+   * suspension points between them, so an eager push can land BETWEEN two
+   * results of one batch — and OpenAI-compatible endpoints answer that with
+   * `400 Unexpected role 'tool' after role 'user'`, because a `tool` message
+   * must directly follow the assistant message that requested it. Parking the
+   * message and draining it here keeps every tool-result group contiguous while
+   * still landing the text before the next request reads the array.
+   */
+  drainInterjections?: () => void;
   signal?: AbortSignal;
   /**
    * Input modalities of the model in force. Called per request and only when a

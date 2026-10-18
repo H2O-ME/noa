@@ -60,6 +60,7 @@ async function midRunHarness(
   scripts: StreamEvent[][] = WORK_THEN_ANSWER,
   onWork?: (agent: AgentSession) => void,
   hooks?: AgentHooks,
+  extraTools: ToolDefinition[] = [],
 ): Promise<MidRun> {
   const dir = await mkdtemp(path.join(tmpdir(), 'nova-interject-'));
   const session = await Session.create(dir, 'sess_interject');
@@ -83,7 +84,7 @@ async function midRunHarness(
     messages,
     provider: scriptedProvider(scripts, requests),
     rootDir: () => tmpdir(),
-    tools: () => [work],
+    tools: () => [work, ...extraTools],
     hooks: () => hooks,
     jobs,
     approvals: broker,
@@ -150,6 +151,53 @@ describe('a message typed while the agent is working', () => {
     // 队列泳道也是给人看的，所以它拿到的必须是原话。
     const queued = h.events.filter((e) => e.type === 'queue_update').at(-1);
     expect(queued === undefined || queued.type !== 'queue_update' || queued.items.every((i) => !i.includes(INTERJECTION_OPEN))).toBe(true);
+  });
+
+  it('never lands between the tool results of one batch', async () => {
+    // 一条 user 消息夹在一批 tool 结果中间，OpenAI 兼容端点是**硬拒**的：
+    // `400 Unexpected role 'tool' after role 'user'`（tool 消息必须紧跟在请求它的
+    // assistant 消息后面）。而 `runToolCalls` 是一条条 push 结果的，中间有挂起点，
+    // 所以「到了就 push」必然能把一批结果劈开——实测就是这个 400。插话因此寄存到
+    // 批次之外，由装配前的那一次落位统一推进去。
+    //
+    // 这里的第二次调用 `second` 就是那个时刻：第一个结果已经在数组里，第二个还没。
+    const TWO_CALLS: StreamEvent[][] = [
+      [
+        { type: 'tool_call_delta', index: 0, id: 'call_1', name: 'work', argsDelta: '{}' },
+        { type: 'tool_call_delta', index: 1, id: 'call_2', name: 'second', argsDelta: '{}' },
+      ],
+      [{ type: 'text_delta', text: '答完了' }, { type: 'finish', finishReason: 'stop' }],
+    ];
+    let agent!: AgentSession;
+    const second: ToolDefinition = {
+      name: 'second',
+      description: 'the second call of the batch',
+      parameters: { type: 'object', properties: {} },
+      execute: () => {
+        agent.interject('趁第二个工具在跑');
+        return 'seconded';
+      },
+    };
+    const h = await midRunHarness(TWO_CALLS, undefined, undefined, [second]);
+    agent = h.agent;
+
+    await h.agent.prompt('先干正事');
+    await untilIdle(h.agent);
+
+    // 不变式：任何一次请求里，第一条与最后一条 tool 消息之间不能再有别的角色。
+    for (const request of h.requests) {
+      const roles = request.messages.map((m) => m.role);
+      const first = roles.indexOf('tool');
+      const last = roles.lastIndexOf('tool');
+      if (first < 0) continue;
+      expect(roles.slice(first, last + 1).every((r) => r === 'tool')).toBe(true);
+    }
+    // 而它并没有被丢掉：落位在整批结果之后，且仍在这一次请求里。
+    const carried = h.requests[1]!;
+    const roles = carried.messages.map((m) => m.role);
+    const spoken = carried.messages.findIndex((m) => m.content.includes('趁第二个工具在跑'));
+    expect(spoken).toBeGreaterThan(roles.lastIndexOf('tool'));
+    expect(spoken).toBeGreaterThan(-1);
   });
 
   it('refuses when nothing is running, so the caller can queue it normally', async () => {

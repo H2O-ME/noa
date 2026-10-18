@@ -155,6 +155,16 @@ export class AgentSession {
   /** Per-run timings for the `run_stats` event (one run at a time). */
   private readonly meter = new RunMeter();
   private readonly pending = new PromptQueue();
+  /**
+   * Messages waiting for a legal landing spot in `messages`. Held here rather
+   * than pushed on arrival because the array may be in the middle of a
+   * tool-result group — see `interject` and `drainInterjections`.
+   *
+   * `logged` is true for a prompt that wrote itself to the log before queueing
+   * (the drain must not write it twice) and false for an interjection, whose
+   * append is the drain's job.
+   */
+  private readonly parked: { message: UserMessage; entry: QueuedPrompt; logged: boolean }[] = [];
   private runController: AbortController | undefined;
   /**
    * The current (or most recent) run. Replaces the old `runController !==
@@ -451,10 +461,15 @@ export class AgentSession {
   }
 
   /**
-   * Commit a user prompt (log + `user_message` event) and start a run when
-   * idle; when a run is in flight the prompt queues — the NEXT run covers
-   * every committed message (they all ride its first request), the queue
-   * itself is the pending-trigger ledger surfaces render as the queue lane.
+   * Commit a user prompt (log, then `user_message` event) and start a run when
+   * idle; when a run is in flight the prompt queues — the NEXT run covers every
+   * committed message (they all ride its first request), the queue itself is the
+   * pending-trigger ledger surfaces render as the queue lane.
+   *
+   * The event follows the landing spot, not the call: a queued prompt publishes
+   * `user_message` when the drain puts it in the array (a few milliseconds, or
+   * the length of the tool batch in flight), not here. A surface that echoes on
+   * the event therefore never draws a message the model has not been given.
    */
   async prompt(text: string, images?: readonly ImageAttachmentRef[]): Promise<void> {
     if (this.closed) throw new Error('agent session is closed');
@@ -467,8 +482,6 @@ export class AgentSession {
     // a message the durable log never received — a divergence that survives
     // every later resume.
     await this.deps.session.append(userMsg);
-    this.deps.messages.push(userMsg);
-    this.publish({ type: 'user_message', message: userMsg });
     // The title does not wait for the turn (nor care whether one is already
     // running): it labels the PROMPT, it rides no queue, and it must never delay
     // or fail the reply. The FIRST prompt titles immediately; after that the
@@ -476,10 +489,13 @@ export class AgentSession {
     // conversation keeps tracking its topic at one small call per few turns.
     this.titlePrompts += 1;
     if (opening || this.titlePrompts > TITLE_REGEN_PROMPTS) this.scheduleTitle();
-    // The message is committed to the live array BEFORE the branch below, so an
-    // in-flight run's next request already carries it: steering needs no extra
-    // channel. The queue entry is only the GUARANTEE that the prompt also gets a
-    // run of its own when this run ends without assembling another request.
+    // An in-flight run's next request carries this message, so steering needs no
+    // extra channel — but it lands through the SAME drain an interjection uses
+    // rather than being pushed here. `messages` may be in the middle of a
+    // tool-result group at this instant (this line is downstream of an `await`),
+    // and a user message there is a 400 on strict providers. See `interject`.
+    // The queue entry is only the GUARANTEE that the prompt also gets a run of
+    // its own when this run ends without assembling another request.
     //
     // THE RACE (this is the "no reply" defect): the flag below is read only
     // after the `await this.deps.session.append(userMsg)` above, which is a real
@@ -494,10 +510,17 @@ export class AgentSession {
     // run that would be spliced out from under it. `compact()` serves the queue
     // when it finishes.
     if (this.running || this.compaction.busy) {
-      this.pending.enqueue(text);
+      this.parked.push({ message: userMsg, entry: this.pending.enqueue(text), logged: true });
       this.publish({ type: 'queue_update', items: this.pending.items });
       return;
     }
+    // Idle: nothing else can be touching `messages` (a tool batch only ever runs
+    // inside a run), so this one needs no drain — and must not wait for one.
+    // `runLoop` can return without ever assembling (a `closed` that landed during
+    // the append above), and a message parked for a loop that never runs would
+    // sit in the log yet never in the array.
+    this.deps.messages.push(userMsg);
+    this.publish({ type: 'user_message', message: userMsg });
     void this.runLoop();
   }
 
@@ -509,16 +532,29 @@ export class AgentSession {
    * `messages` 数组是共享引用，见 `prompt-queue.ts` 的文件头）。所以这条路径**不
    * 启动任何东西**——没有新 run、没有新循环，只是把话放进模型下次一定会读到的地方。
    *
+   * ## 为什么先寄存、不直接推进数组
+   *
+   * 落地位置**不能是「此刻」**。`runToolCalls` 把一批工具结果**一条条**推进
+   * `messages`，两条之间有挂起点；插话若在那一刻入数组，就会落进一批工具结果的
+   * **中间**。OpenAI 兼容端点上这是硬错：`400 Unexpected role 'tool' after role
+   * 'user'`——`tool` 消息必须紧跟在请求它的 assistant 消息后面。这是实测结论，不是
+   * 推理（同一端点正常分组 200、中间插一条 user 就 400）。Hermes 为同一个原因把
+   * steer 攒到批次末尾再注入（`_apply_pending_steer_to_tool_results`）。
+   *
+   * 所以这里只把消息放进 `parked`，由运行循环在**装配请求之前**统一落位
+   * （`drainInterjections`，经 `AgentOptions.drainInterjections` 挂进循环）。那个点
+   * 上数组不在一批结果的中间，落位一定合法；而且它仍在这次装配之前，所以「这一轮
+   * 的下一次请求会读到它」这条承诺不变。
+   *
    * ## 为什么整个方法是同步的
    *
-   * 判断「有没有在跑」、把消息推进 `messages`、往队列里记一格——这三件事之间**不能
-   * 有 await**。装配发生在运行循环的 await 点上；如果这三步之间存在挂起点，一次装配
-   * 就可能挤在中间，读到「消息已经在数组里、但队列还没有这一格」的状态：那一格会在
-   * 下一次装配被当作已读吸收掉（`recordAssembly` 按计数吸收），而这一次请求里并没有
-   * 这条消息——**插话从此消失**，而且一声不响。同步执行让这三步对外是一个原子动作，
-   * 于是无论装配落在它前面还是后面，两边都自洽。
+   * 「有没有在跑」的判断、寄存、往队列里记一格——这三件事之间**不能有 await**。
+   * 队列那一格是按装配计数吸收的（`recordAssembly`），如果寄存和入队之间存在挂起点，
+   * 一次装配就可能挤在中间：那一格会被当作已读吸收掉，而消息还没落进数组——**插话
+   * 从此消失**，而且一声不响。同步执行让这三步对外是一个原子动作。落位本身也在同步的
+   * drain 里完成，所以它和装配之间同样没有缝。
    *
-   * 因此持久写入（`session.append`）被放到同步块**之后**，失败时回滚。这与
+   * 持久写入（`session.append`）在 drain 里、同步落位**之后**发起，失败时回滚。这与
    * `runAgent` 生成的消息走的是同一条路（`commit()`：先 push、失败再按身份撤回），
    * 不是新引入的顺序。
    *
@@ -537,13 +573,27 @@ export class AgentSession {
   interject(text: string, images?: readonly ImageAttachmentRef[]): boolean {
     if (this.closed || !this.running) return false;
     const userMsg = this.userMessage(formatInterjection(text), images);
-    this.deps.messages.push(userMsg);
-    this.publish({ type: 'user_message', message: userMsg });
     // 队列里的那一格存**用户原话**：队列泳道是给人看的，标记是给模型的。
     const entry = this.pending.enqueue(text);
+    this.parked.push({ message: userMsg, entry, logged: false });
     this.publish({ type: 'queue_update', items: this.pending.items });
-    void this.persistInterjection(userMsg, entry);
     return true;
+  }
+
+  /**
+   * 把寄存的插话落进数组与日志。由运行循环在装配请求之前调用（见
+   * `AgentOptions.drainInterjections`），也在循环退出时兜底调用一次——否则一条
+   * 「在跑、但循环已经决定不再装配」时进来的话会留在寄存区里，永远不进日志。
+   *
+   * 同步：数组推入与事件发布之间没有挂起点，所以它和紧随其后的装配之间没有缝。
+   */
+  private drainInterjections(): void {
+    if (this.parked.length === 0) return;
+    for (const item of this.parked.splice(0, this.parked.length)) {
+      this.deps.messages.push(item.message);
+      this.publish({ type: 'user_message', message: item.message });
+      if (!item.logged) void this.persistInterjection(item.message, item.entry);
+    }
   }
 
   /**
@@ -914,6 +964,16 @@ export class AgentSession {
     } finally {
       this.runController = undefined;
       this.setPhase('idle');
+      // Backstop for a message that parked but never got a landing spot: the
+      // loop can stop assembling while one is still held (abort withdrew its
+      // trigger, or the run ended on the message's own turn). Its trigger may
+      // be gone, but the TEXT belongs in the log — `abort()` withdraws
+      // triggers, never what the user actually said.
+      //
+      // Skipped on a closed session: `dispose()` seals the log before this
+      // runs, so the append would fail and report an undelivered message for
+      // a session that is being torn down (its surface is gone too).
+      if (!this.closed) this.drainInterjections();
       // Reachable with a queue only when the loop could not serve it (closed
       // session, run that assembled nothing). Withdraw the triggers so none can
       // silently execute later; the TEXT stays in the append-only log.
@@ -1022,6 +1082,9 @@ export class AgentSession {
       maxTurns: deps.maxTurns,
       cacheDir: deps.cacheDir(),
       jobs: deps.jobs,
+      // Mid-run messages land here, at the one point where appending is always
+      // wire-legal. See AgentOptions.drainInterjections.
+      drainInterjections: () => this.drainInterjections(),
       // The run froze this scope at creation; the loop reads it, never rebuilds it.
       scope: run.scope,
       emit: async (evt) => {

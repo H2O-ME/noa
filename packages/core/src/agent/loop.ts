@@ -95,6 +95,9 @@ export async function* runAgent(opts: AgentOptions): AsyncGenerator<AgentEvent> 
       // name — see the accounting below). Reset per turn so only the CURRENT
       // turn's snapshot clears the counter.
       staleTodo.pendingWrite = false;
+      // Last moment before the array is read: commit any mid-run message that
+      // parked while a tool batch was in flight (see drainInterjections).
+      opts.drainInterjections?.();
       const request = await assembleRequest(watchedOpts, notices);
       const outcome = yield* streamCompletion(opts, request, messageId, stats, notices);
       if (outcome.interrupted) return;
