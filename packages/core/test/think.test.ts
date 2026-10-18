@@ -20,7 +20,11 @@ import {
   THINK_CLOSE_TAGS,
   THINK_OPEN_TAGS,
   stripThinkBlocks,
-} from '../src/agent/think.js';
+  runAgent,
+  type AgentMessage,
+  type ToolDefinition,
+} from '../src/index.js';
+import { collect, scriptedProvider } from './helpers/scripted-provider.js';
 
 /** Tag order follows `THINK_TAG_NAMES`: think, thinking, reasoning, … 推理. */
 const [OPEN_THINK, OPEN_THINKING, OPEN_REASONING] = THINK_OPEN_TAGS as [string, string, string];
@@ -131,5 +135,62 @@ describe('StreamingThinkScrubber', () => {
     expect(scrubber.feed(`思考\n${OPEN_THINK}想`)).toBe('思考\n');
     expect(scrubber.feed('推理推理推理')).toBe('');
     expect(scrubber.feed(CLOSE_THINK)).toBe('');
+  });
+});
+
+describe('真实轮次的形状（线上日志里量出来的）', () => {
+  /**
+   * 一台网关上量到的事实：`MiMo-V2.6-Flash` 的 8 条消息里有 7 条是「思考 + 调工具」，
+   * 而且那 7 条的思考**根本没有闭合标签**——模型想着想着直接去调工具了。所以「未闭合的
+   * 块尾部丢掉」这条规则，在真实流量里就是「这一轮的文本本来就是草稿纸，一条都不该给
+   * 用户」。这一条把它钉住：文本变空，但工具调用必须照旧跑完。
+   */
+  it('一个整轮都是未闭合思考的工具轮：文本为空，工具照跑', async () => {
+    const tool: ToolDefinition = {
+      name: 'probe',
+      description: 'test fixture',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      execute: () => 'probe-ok',
+    };
+    const provider = scriptedProvider([
+      [
+        { type: 'text_delta', text: `${OPEN_THINK}\nLet me check the prerequisites first.` },
+        { type: 'tool_call_delta', index: 0, id: 'c1', name: 'probe', argsDelta: '{}' },
+        { type: 'finish', finishReason: 'tool_calls' },
+      ],
+      [{ type: 'text_delta', text: '查完了。' }, { type: 'finish', finishReason: 'stop' }],
+    ]);
+    const messages: AgentMessage[] = [];
+    const events = await collect(runAgent({ provider, messages, rootDir: '.', tools: [tool] }));
+
+    const assistants = messages.filter((m) => m.role === 'assistant');
+    // 第一轮：草稿纸一个字都不留，但调用还在——空文本 + 有调用，所以也**不该**被当成
+    // 「空补全」去重试（重试会把已经跑过的工具再跑一遍）。
+    expect(assistants[0]?.content).toBe('');
+    expect(assistants[0]?.toolCalls).toHaveLength(1);
+    expect(events.some((e) => e.type === 'empty_completion')).toBe(false);
+    // 工具真的跑了，第二轮拿到了干净的回答。
+    expect(messages.find((m) => m.role === 'tool')?.content).toBe('probe-ok');
+    expect(assistants[1]?.content).toBe('查完了。');
+    expect(events.some((e) => e.type === 'done')).toBe(true);
+    // 会话里不该再有任何一段带标签的文本。
+    for (const m of messages) {
+      if (typeof m.content === 'string') expect(m.content).not.toMatch(/<think/i);
+    }
+  });
+
+  it('收尾轮：块内推理丢掉，块后的回答原样留下', async () => {
+    const provider = scriptedProvider([
+      [
+        { type: 'text_delta', text: `${OPEN_THINK}\nThe user wants a short answer.\n${CLOSE_THINK}\n\n` },
+        { type: 'text_delta', text: '清理已排程，40 秒后重启。' },
+        { type: 'finish', finishReason: 'stop' },
+      ],
+    ]);
+    const messages: AgentMessage[] = [];
+    await collect(runAgent({ provider, messages, rootDir: '.' }));
+
+    const assistant = messages.find((m) => m.role === 'assistant');
+    expect(assistant?.content).toBe('\n\n清理已排程，40 秒后重启。');
   });
 });
