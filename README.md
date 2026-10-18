@@ -165,16 +165,17 @@ Noa 的提示词是**产品自己的**，住在 `packages/app/src/prompt.ts`（�
 `deploy/` 里是这台机器实际在跑的 systemd 单元，`scripts/noa-update.sh` 是自动更新脚本。
 
 ```bash
-install -m 0755 scripts/noa-update.sh /opt/noa/scripts/noa-update.sh
+install -m 0755 scripts/noa-update.sh /usr/local/bin/noa-update
 install -m 0644 deploy/noa.service deploy/noa-update.service deploy/noa-update.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now noa.service noa-update.timer
 ```
 
-`noa-update.timer` 每 5 分钟跑一次 `noa-update.sh`，它只做一件事：**origin 动了才动**。commit 没变就直接退出，不重建、不重启——重启会断开 QQ 网关连接，代价由用户承担。commit 变了则 `git merge --ff-only` → `pnpm install --frozen-lockfile` → `pnpm build` → `systemctl restart noa`。
+`noa-update.timer` 每 5 分钟跑一次 `/usr/local/bin/noa-update`，它只做一件事：**origin 动了才动**。commit 没变就直接退出，不重建、不重启——重启会断开 QQ 网关连接，代价由用户承担。commit 变了则 `git merge --ff-only` → `pnpm install --frozen-lockfile` → `pnpm build` → `systemctl restart noa`。
 
-三条刻意的取舍：
+四条刻意的取舍：
 
+- **更新器装在仓库外面**。`scripts/noa-update.sh` 是分发源，运行副本在 `/usr/local/bin/noa-update`，脚本每次成功更新后会原子地把自己同步过去（写 `.new` 再 `mv`，因为就地覆写一个 bash 正在读的脚本会让它读到半截）。这不是洁癖：更新器要是住在被自己更新的那棵树里，任何一个删掉或移动它的提交都会让定时器永久失能——而唯一能把它恢复回来的东西正是它自己。这条是实测踩出来的，`ExecStart` 指向树内路径时，一次 `git reset` 就能让 unit 变成 `status=203/EXEC`，从此再不恢复。
 - **构建失败绝不重启**。旧 `dist` 还能用，坏构建上线才是真事故。失败时退回上一个已知可用的 commit **并重建它**（否则 `dist` 里会留下半新半旧的产物，下次崩溃重启就会加载一个拼出来的运行时），同时记下那个坏 SHA，免得每 5 分钟重试同一个坏提交。
 - **只用 `--ff-only`**，绝不自动合并、绝不自动丢弃本地改动。部署目录里出现本地改动只可能是有人手动改过，那要看一眼，不是让定时器半夜 `reset` 掉。
 - **`flock` 单实例**。构建可能比定时器周期还长，两个 `git` 同时改一棵树是会出事的。

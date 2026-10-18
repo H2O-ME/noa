@@ -12,6 +12,12 @@
 #   3. 同一时刻只有一个实例。构建可能比定时器周期还长，两个 git 同时改一棵树
 #      是会出事的（flock）。
 #
+# 这份脚本从仓库里分发，但**运行副本装在仓库外面**（/usr/local/bin/noa-update，
+# 见 SELF）。这不是洁癖：更新器要是住在被自己更新的那棵树里，任何一个删掉或
+# 移动它的提交都会让定时器永久失能——而唯一能把它恢复回来的东西正是它自己。
+# 实测踩过：把部署目录退回脚本尚未存在的那次提交，unit 立刻变成
+# `status=203/EXEC, Failed to locate executable`，从此再不恢复。
+#
 # 失败一律写 journal（SyslogIdentifier 见 deploy/noa-update.service），不静默。
 set -euo pipefail
 
@@ -19,10 +25,26 @@ REPO_DIR="${NOA_REPO_DIR:-/opt/noa}"
 BRANCH="${NOA_BRANCH:-master}"
 STATE_DIR="${NOA_UPDATE_STATE:-/var/lib/noa-update}"
 SERVICE="${NOA_SERVICE:-noa}"
+SELF="${NOA_SELF:-/usr/local/bin/noa-update}"
 LOCK_FILE="$STATE_DIR/lock"
 BAD_SHA_FILE="$STATE_DIR/last-failed-sha"
 
 log() { printf '%s noa-update: %s\n' "$(date -Is)" "$*"; }
+
+# 把仓库里的新版本原子地换到运行位置：先写 .new 再 mv（换 inode），因为就地
+# 覆写一个 bash 正在读的脚本会让它读到半截。本次运行仍用已经在跑的这份逻辑，
+# 新版下一次生效——绝不在执行途中换掉自己。
+sync_self() {
+  local src="$REPO_DIR/scripts/noa-update.sh"
+  [ -f "$src" ] || return 0
+  cmp -s "$src" "$SELF" && return 0
+  if install -m 0755 "$src" "$SELF.new" && mv -f "$SELF.new" "$SELF"; then
+    log "installed a newer $SELF (takes effect next run)"
+  else
+    log "could not install $SELF; keeping the current one"
+    rm -f "$SELF.new"
+  fi
+}
 
 mkdir -p "$STATE_DIR"
 exec 9>"$LOCK_FILE"
@@ -77,5 +99,8 @@ if ! pnpm build; then
 fi
 
 rm -f "$BAD_SHA_FILE"
+# 只在构建成功之后同步自己：宁可继续用旧版更新器，也不要让一个跟着坏树一起
+# 进来的脚本版本接管这台机器。
+sync_self
 systemctl restart "$SERVICE"
 log "restarted $SERVICE at ${target:0:7}"

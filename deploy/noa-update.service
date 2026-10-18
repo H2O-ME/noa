@@ -6,7 +6,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/noa
-ExecStart=/opt/noa/scripts/noa-update.sh
+# 跑的是装在仓库**外面**的那一份副本，不是 /opt/noa/scripts/noa-update.sh。
+# 更新器住在被自己更新的树里，删掉它的那个提交就会让定时器永久失能。
+# 仓库里的 scripts/noa-update.sh 是分发源，脚本每次成功更新后会自己同步过来。
+ExecStart=/usr/local/bin/noa-update
 # 构建不是瞬时的，而 oneshot 的默认超时在部分 systemd 版本上并不如文档所说
 # 是「禁用」——写死一个够宽的值，免得构建中途被 SIGTERM 打断、留下半新半旧的
 # dist。
