@@ -55,8 +55,14 @@ export interface QqBotChannelOptions {
    * 答复也要排队，它会永远排在自己所等的那一轮后面。所以遥控指令不进队列。
    */
   remote?: InboundHandlerOptions['remote'];
-  /** 新消息打断在跑的那一轮：见 `InboundHandlerOptions.interrupt`。 */
-  interrupt?: InboundHandlerOptions['interrupt'];
+  /**
+   * 新消息插进在跑的那一轮：见 `InboundHandlerOptions.interject`。
+   *
+   * 它取代了早先的 `interrupt` 座位（新消息打断在跑的那一轮）。区别是决定性的：打断会
+   * 把一轮里已经发生的副作用留在原地却不再解释它们，而插话让话进得去、活儿接着干。
+   * 要停下仍然有 `/stop`。
+   */
+  interject?: InboundHandlerOptions['interject'];
   /**
    * 语音转写座位：入站语音附件 → 文字。缺省 = 未配置转写，语音降级为一句说明。
    * 平台自带的 `asr_refer_text` 不走这里（免费、不用下载）。
@@ -161,7 +167,7 @@ export function createQqBotChannel(options: QqBotChannelOptions): QqBotChannel {
     },
     ...(options.remote !== undefined ? { remote: options.remote } : {}),
     interact: (interactionId) => api.respondInteraction(interactionId),
-    ...(options.interrupt !== undefined ? { interrupt: options.interrupt } : {}),
+    ...(options.interject !== undefined ? { interject: options.interject } : {}),
     ...(options.transcribe !== undefined ? { transcribe: options.transcribe } : {}),
     ...(options.mediaHomedir !== undefined ? { mediaHomedir: options.mediaHomedir } : {}),
   });

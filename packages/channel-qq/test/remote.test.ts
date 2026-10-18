@@ -7,7 +7,7 @@
  *  - 远程审批超时**必拒**——一个挂着的审批会把整轮运行永久停住，QQ 对端随时可能不回。
  */
 import { describe, expect, it, vi } from 'vitest';
-import type { ApprovalMode, AskResult, PricingTable, TurnRewind, UsageStats } from '@noa/core';
+import { formatInterjection, type ApprovalMode, type AskResult, type PricingTable, type TurnRewind, type UsageStats } from '@noa/core';
 import {
   awaitRemoteAnswer,
   runRemoteCommand,
@@ -300,6 +300,18 @@ describe('/undo and /retry', () => {
     });
     const out = await runRemoteCommand({ kind: 'retry' }, ctx);
     expect(out.resend?.images).toEqual([image]);
+  });
+
+  it('strips the interjection marker when re-sending a turn that was an interjection', async () => {
+    // 被撤销的那一轮可能是一次**中途插话**，正文里带着给模型的插话标记。重发时它不再是
+    // 插话——没有「正在跑的那一轮」可以插进去，它会作为一条普通提示词开一轮新的。留着
+    // 标记等于对模型说一句当时为真、现在为假的话。
+    const marked = formatInterjection('顺便看看 8080 端口');
+    const { ctx } = makeCtx({
+      rewind: () => Promise.resolve({ ...plan(1), prompt: { ...plan(1).prompt, content: marked } }),
+    });
+    const out = await runRemoteCommand({ kind: 'retry' }, ctx);
+    expect(out.resend?.text).toBe('顺便看看 8080 端口');
   });
 
   it('advertises both verbs', async () => {

@@ -51,6 +51,20 @@ const TOOLS_PER_LINE = 6;
  */
 export const EMPTY_TURN_LINE = '（本轮没有要说的文本，工作已完成。）';
 
+/**
+ * 插话回执：一条中途消息被并进正在跑的那一轮之后，对端听到的那句话。
+ *
+ * 存在的理由是**沉默会被读成丢失**。没有它，用户在机器人忙着的时候发一句话，直到整轮
+ * 结束才听到任何动静——而这一轮可能还要跑几分钟，他没有任何办法分辨「话已经进去了，
+ * 正在干」和「消息丢了」。
+ *
+ * 它按**叙述**配额走（可丢），不按回复配额：回复那一格留给答案，一条回执把它花掉就是
+ * 用「收到了」换掉「做完了」。代价是额度真紧时回执可能发不出去——那时答案还在，而那
+ * 正是必须保住的那一条。顺序上它总是先到：窗口是在这条消息入站时新建的，而回执在同
+ * 一个同步块里就记账了，所以它抢在那一轮后续的任何叙述之前占位。
+ */
+export const INTERJECT_ACK = '已并进正在跑的那一轮，它下次读消息时会看到。要立刻停下用 /stop。';
+
 export interface ProgressRelayOptions {
   /** Where one line goes (the passive-window sender). Absent = nothing is sent. */
   send: (text: string) => void;

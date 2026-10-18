@@ -14,7 +14,7 @@
  *
  * 全部依赖注入，所以每一条都能对着假实现直接驱动，不需要网络也不需要真内核。
  */
-import { errMessage } from '@noa/core';
+import { errMessage, interjectionText } from '@noa/core';
 import {
   costOf,
   type AgentSession,
@@ -520,7 +520,11 @@ export async function runRemoteCommand(command: RemoteCommand, ctx: RemoteContex
       return {
         reply: '',
         resend: {
-          text: prompt.content,
+          // 被撤销的那一轮若是一次**中途插话**，正文里带着给模型的插话标记
+          // （`interjection.ts`）。重发时必须把标记剥掉：这一次它不是插话——没有
+          // 「正在跑的那一轮」可以插进去，它会作为一条普通提示词开一轮新的。留着标记
+          // 等于对模型说一句当时为真、现在为假的话。
+          text: interjectionText(prompt.content),
           ...(prompt.images === undefined ? {} : { images: prompt.images }),
         },
       };

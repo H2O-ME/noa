@@ -246,9 +246,10 @@ export const plugin: Plugin<QqBotPluginConfig> = {
         // 遥控是文本：附件消息永远不会走到这里（入站侧已按有无附件分流）。
         handle: (text, peer) => guarded({ text }, peer),
       },
-      // 新消息 = 新意图：把在跑的那一轮打断，而不是让它排队等完（`/stop` 是同一个
-      // 动作的点名版，两者都落在 `AgentSession.abort()`）。
-      interrupt: (peer: Peer) => turns.interrupt(peer),
+      // 新消息 = 新的意图，但它**插进**在跑的那一轮，而不是把它打断：一轮里可能已经
+      // 跑过 bash、写过文件，打断等于把已经发生的副作用留在原地却不再解释它们。真要
+      // 立刻停下，`/stop` 是点名的那条路（它走旁路，仍落在 `AgentSession.abort()`）。
+      interject: (turn, peer) => turns.interject(turn, peer),
       // 语音转写：容器里有就接上，没有就缺省（语音消息降级为「未配置转写」）。
       // `get` 而不是 `must`：未配置 `sttModel` 是受支持的状态，不是启动失败。
       ...(() => {

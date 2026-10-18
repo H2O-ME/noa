@@ -35,7 +35,7 @@ const NOTHING_READABLE_LINE = '（收到了消息，但里面没有我能读到�
  * 一次要跑的入站轮次：文本 + 原始附件。
  *
  * Attachments stay RAW here on purpose: resolving an image is a network round trip,
- * and this type is built on the synchronous gateway callback path. `replyOnce`
+ * and this type is built on the synchronous gateway callback path. `deliver`
  * resolves them once the message is off that path.
  */
 interface PendingTurn {
@@ -86,13 +86,19 @@ export interface InboundHandlerOptions {
    */
   interact?: (interactionId: string) => Promise<void>;
   /**
-   * 打断这个对端正跑着的那一轮（有则返回 true）。
+   * 把这条消息**插进正在跑的那一轮**（有则返回 true）。
    *
-   * 一条新消息是**新的意图**：排队让它等上一轮跑完，等于让人对着手机等一个自己
-   * 已经改主意的问题。所以新消息先把在跑的轮次打断，再按顺序跑（中断的轮次在
-   * 日志里留下 `<turn_aborted>` 标记，模型看得见自己被打断过）。
+   * 一条新消息是**新的意图**，而它不该等上一轮跑完：排队等于让人对着手机等一个自己
+   * 已经改主意的问题。但它也不该把上一轮**打断**——一轮里可能已经跑过 bash、写过
+   * 文件，打断等于把已经发生的副作用留在原地却不再解释它们。插话是第三条路，也是唯一
+   * 一个既不失礼也不丢工作的：话进得去，活儿接着干。真要立刻停下，`/stop` 是点名的
+   * 那条路。
+   *
+   * **必须是同步的**：判定「有没有在跑」和把消息放进模型下一次一定读到的地方，中间
+   * 不能有挂起点（理由见 `AgentSession.interject`）。所以这个座位只做一件事，附件
+   * 解析在它之前就做完了。
    */
-  interrupt?: (peer: Peer) => boolean;
+  interject?: (turn: TurnInput, peer: Peer) => boolean;
 }
 
 /** 入站事件的处理器：网关把每条 dispatch 交给它。 */
@@ -198,16 +204,42 @@ export class InboundHandler {
       void this.runRemote(text, peer);
       return;
     }
-    // 新消息 = 新意图：先把在跑的那一轮打断，再入队。旁路指令不在此列——它们
-    // 本来就不排队（`/stop` 就是那条用来打断的路）。
-    this.options.interrupt?.(peer);
-    this.queue = this.queue
-      .then(() => this.replyOnce(
-        { text: message.content, ...(message.attachments !== undefined ? { attachments: message.attachments } : {}) },
-        peer,
-      ))
-      .catch(() => undefined);
+    // 新消息 = 新的意图，三条去路见 `deliver`：插进正在跑的那一轮、排在队列后面，
+    // 或自己开一轮。旁路指令不在此列——它们本来就不排队（`/stop` 是那条用来停下的路）。
+    void this.deliver(
+      { text: message.content, ...(message.attachments !== undefined ? { attachments: message.attachments } : {}) },
+      peer,
+    );
   };
+
+  /**
+   * 一条普通消息的去路：插话、排队，或自己开一轮。
+   *
+   * 顺序是有意的，而且是这里唯一微妙的地方。先把这一轮解析出来（下载附件，异步），
+   * **再**做插话判定（同步）。反过来——先判定、再解析、再插话——会给出一个假答案：
+   * 判定时说「正在跑」，而真正把消息放进数组时那一轮已经结束了，消息于是进了一个没有
+   * 人会再读的轮次，一声不响地消失。先解析则没有这个窗口：判定与落地在同一个同步块
+   * 里，要么整件事成立，要么整件事不成立。
+   *
+   * 代价是解析期间那一轮可能结束，插话于是落空。那不是错误，那正是「晚了一步」的正确
+   * 读法——这条消息改走队列，自己开一轮。
+   *
+   * 解析也从队列里搬到了这里：队列是串行的，而插话必须在轮次还在跑的时候就完成判定，
+   * 排队等它等于永远等不到。附件本身与顺序无关（内容寻址、不可变），并发解析不会互相
+   * 干扰。
+   * @param pending - the raw inbound turn (text plus attachments).
+   * @param peer - who sent it.
+   */
+  private async deliver(pending: PendingTurn, peer: Peer): Promise<void> {
+    if (this.closed) return;
+    const turn = await this.turnOf(pending, peer);
+    if (this.closed) return;
+    if (turn !== undefined && this.options.interject?.(turn, peer) === true) return;
+    // 没插成（没有在跑的轮次，或插话判定为假）：照旧排队，由它自己开一轮。
+    this.queue = this.queue
+      .then(() => (turn === undefined ? this.answerUnreadable(peer) : this.replyOnce(turn, peer)))
+      .catch(() => undefined);
+  }
 
   /**
    * 这个 msg_id 在 TTL 窗口内是不是已经见过；顺手把它记下并维护容量上限。
@@ -286,18 +318,11 @@ export class InboundHandler {
     }
   }
 
-  private async replyOnce(pending: PendingTurn, peer: Peer): Promise<void> {
+  private async replyOnce(turn: TurnInput, peer: Peer): Promise<void> {
     // Queued behind an earlier turn — the channel may have been switched off in
     // the meantime, in which case this message must not reach the model at all.
     if (this.closed) return;
     const { brain, reply, log } = this.options;
-    const turn = await this.turnOf(pending, peer);
-    if (turn === undefined) {
-      // Media-only with nothing resolvable: answer honestly instead of running an
-      // empty turn (a prompt with no text and no images is a turn about nothing).
-      if (await sendReply(reply, log, peer, { text: NOTHING_READABLE_LINE }, 'replied')) this.replied += 1;
-      return;
-    }
     let answer: RemoteAnswer;
     try {
       answer = await brain(turn, peer);
@@ -309,11 +334,18 @@ export class InboundHandler {
     if (await sendReply(reply, log, peer, answer, 'replied')) this.replied += 1;
   }
 
+  /** 一条有附件但没有可读内容的消息：如实回一句，不开空轮次。 */
+  private async answerUnreadable(peer: Peer): Promise<void> {
+    if (this.closed) return;
+    const { reply, log } = this.options;
+    if (await sendReply(reply, log, peer, { text: NOTHING_READABLE_LINE }, 'replied')) this.replied += 1;
+  }
+
   /**
    * 把一条待跑的入站消息变成 brain 的输入：文本 + 图片引用。
    *
-   * 下载在这里（队列内、异步），不在 `onDispatch` 里——网关回调是同步的，而一次下载
-   * 是一次网络往返。图片与语音逐件独立，失败的只记日志、不拖垮整条消息。
+   * 下载在这里（异步），不在 `onDispatch` 里——网关回调是同步的，而一次下载是一次
+   * 网络往返。图片与语音逐件独立，失败的只记日志、不拖垮整条消息。
    * @param pending - the text and attachments.
    * @param peer - who sent it (for the log line).
    * @returns the turn, or undefined when there is nothing readable in it.

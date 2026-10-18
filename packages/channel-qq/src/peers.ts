@@ -24,7 +24,7 @@ import type { BindingsStore } from './bindings.js';
 import type { Peer, TurnInput } from './types.js';
 import { PendingAsks } from './ask-forward.js';
 import { answerPendingQuestion } from './question-answer.js';
-import { EMPTY_TURN_LINE } from './progress.js';
+import { EMPTY_TURN_LINE, INTERJECT_ACK } from './progress.js';
 import { parseRemoteCommand, splitSlash } from './remote-parse.js';
 import { runRemoteCommand, type RelayCandidate, type RemoteKernelPort, type RemoteRelayPort } from './remote.js';
 import type { RichSend } from './protocol.js';
@@ -271,15 +271,32 @@ export class PeerTurns {
   }
 
   /**
-   * 打断这个对端正跑着的那一轮（有则 true）。
+   * 把这条消息**插进**这个对端正跑着的那一轮（有则 true）。
    *
-   * 与 `/stop` 是同一个动作，只是触发者不同：那边是操作者点名要停，这边是一条新消息
-   * 到了——两者都走 `AgentSession.abort()`，不另造一条「怎么停」的路。
+   * 与 `prompt()` 的区别只有一条：消息落到一个已经在跑的轮次里，那一轮的下一次请求
+   * 就会读到它——所以这里**不启动任何东西**，只是把话放进模型下次一定读到的地方。
+   *
+   * 三条边界，都在「拿不到活句柄」这一侧：
+   *
+   *  - 用 `this.peers` 直查而不是 `agentFor()`：后者是异步的（可能要 resume 一段
+   *    会话），而插话必须同步。代价是绑定存在但本进程没有活句柄时插不了话——那正是
+   *    「没有在跑的轮次」的定义，返回 false 让调用方走队列，是对的。
+   *  - 句柄不在跑就返回 false，不排队也不 abort：没有要插的那一轮，这条消息自己就是
+   *    一轮，走普通路。
+   *  - **不 abort**。以前这里是 `interrupt`（新消息打断在跑的那一轮），它的问题是把
+   *    已经发生的副作用留在原地却不再解释它们。要停下仍然有 `/stop`。
+   * @param turn - 已经解析好的一轮（文本 + 图片引用）。
+   * @param peer - 发消息的 QQ 对端。
+   * @returns true 表示已插进在跑的那一轮。
    */
-  interrupt(peer: Peer): boolean {
+  interject(turn: TurnInput, peer: Peer): boolean {
     const agent = this.peers.get(peer.peerId);
     if (agent === undefined || !agent.running) return false;
-    agent.abort();
+    if (!agent.interject(turn.text, turn.images)) return false;
+    // 回执走**叙述**配额（可丢），不进回复储备：回复那一格留给答案（见
+    // `INTERJECT_ACK`）。结果刻意不看——回执丢了不等于话没进去，而插话这件事已经在
+    // 上面成立了；为一条可丢的叙述去写一条日志，只会让「插话成功」有两种说法。
+    this.deps.notify(peer, INTERJECT_ACK);
     return true;
   }
 
