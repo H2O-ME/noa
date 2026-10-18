@@ -26,12 +26,29 @@ describe('buildNoaSystemPrompt', () => {
     expect(buildNoaSystemPrompt('   \n')).toBe(buildNoaSystemPrompt());
   });
 
-  it('says the tool list is not a promise about this deployment', () => {
-    // 工具名来自可选插件（advanced 档，配置没开就不加载）。不说清这一点，模型会去调
-    // 一个不存在的工具，拿到一句 unknown tool，然后自己编解释——实测它对用户说
-    // 「这个环境里记忆检索功能不可用」，而那只是那台机器没启用那个插件。
-    expect(NOA_TOOLS).toContain('not a promise about THIS deployment');
-    expect(NOA_TOOLS).toContain('names the tools you really have');
+  it('names only unconditionally-registered tools as available', () => {
+    // 实测（2026-10-18）：提示词把 run_code / subagent / skill / switch_workspace 与
+    // 内置工具并列，模型据此告诉用户它能跑 TypeScript、能派子代理，然后四个调用全部
+    // 返回 unknown tool——而它一开始还宣称这些工具可用。底部一句「名单不是承诺」挡不住
+    // 一个正在扫能力的模型，所以「可用」与「可能有」在文本上就必须分开。
+    const marker = 'MAY also carry';
+    const at = NOA_TOOLS.indexOf(marker);
+    expect(at).toBeGreaterThan(0);
+    const available = NOA_TOOLS.slice(0, at);
+    const conditional = NOA_TOOLS.slice(at);
+
+    // 条件注册的：只能在第二节出现。
+    for (const name of ['run_code', 'subagent', 'skill', 'switch_workspace', 'memory', 'recall', 'create_goal', 'update_goal']) {
+      expect(conditional).toContain(name);
+      expect(available).not.toContain(name);
+    }
+    // 无条件注册的：第一节必须点名，否则模型不知道该优先用哪个。
+    for (const name of ['read_file', 'list_dir', 'search_files', 'write_file', 'edit_file', 'bash', 'jobs', 'todo_write', 'web_fetch', 'web_search', 'ask_user_question']) {
+      expect(available).toContain(name);
+    }
+    // 工具表本身被声明为权威，unknown tool 被声明为「这就是答案」。
+    expect(NOA_TOOLS).toContain('IS this deployment');
+    expect(NOA_TOOLS).toContain('unknown tool is that answer');
   });
 
   it('lets a soul replace the identity without dropping the stale-name note', () => {
