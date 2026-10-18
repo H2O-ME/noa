@@ -13,6 +13,7 @@
  */
 import { oneLineText } from '../text.js';
 import { isContextFragment } from '../context-fragment.js';
+import { stripThinkBlocks } from '../agent/think.js';
 import { stripTitleWrappers } from '../session/session-title.js';
 import type { AgentMessage, ChatProvider, UserMessage } from '../types.js';
 
@@ -100,7 +101,9 @@ export async function generateSessionTitle(
   })) {
     if (evt.type === 'text_delta') text += evt.text;
   }
-  return normalizeTitle(text);
+  // Reasoning tags come off first: a title model that thinks inline would
+  // otherwise label the session with its scratchpad.
+  return normalizeTitle(stripThinkBlocks(text));
 }
 
 /**

@@ -28,7 +28,7 @@
  * `CallReviewer`. Where the provider comes from (the main endpoint, a cheaper
  * model id) is the assembly's business — see the app's `createReviewProvider`.
  */
-import type { ChatProvider, ToolCall, ToolPermissionKind, UserMessage } from '@noa/core';
+import { stripThinkBlocks, type ChatProvider, type ToolCall, type ToolPermissionKind, type UserMessage } from '@noa/core';
 
 /** What the reviewer decided about one call. */
 export type ReviewVerdict =
@@ -142,7 +142,10 @@ export function createLlmReviewer(options: LlmReviewerOptions): CallReviewer {
       } finally {
         clearTimeout(timer);
       }
-      return parseVerdict(text);
+      // The verdict is one word; a model that thinks inline would put its
+      // reasoning in front of it, and an unparsed word escalates to the human.
+      // Strip the tags so a routine call is not escalated just for thinking.
+      return parseVerdict(stripThinkBlocks(text));
     },
   };
 }

@@ -11,6 +11,7 @@ import {
   type AgentOptions,
 } from './options.js';
 import { requeueUnaccounted, type NoticeState } from './notices.js';
+import { StreamingThinkScrubber } from './think.js';
 import type { ChatRequest } from '../types.js';
 
 /** Append the abort marker to the log and surface it for persistence. */
@@ -59,11 +60,16 @@ export async function* streamCompletion(
   let usage: Usage | undefined;
   const partialCalls = new Map<number, { id?: string; name?: string; args: string }>();
   let emptyRetries = 0;
+  // Hides reasoning that an endpoint streams as ordinary content (see
+  // `think.ts`). Per attempt: a provider reset replays the response from
+  // scratch, so the tags it already consumed must not carry over.
+  const scrubber = new StreamingThinkScrubber();
   for (;;) {
     content = '';
     partialCalls.clear();
     finishReason = undefined;
     usage = undefined;
+    scrubber.reset();
     // Cumulative stats as of the start of the in-flight attempt: a provider
     // reset rolls the running stats back to this snapshot, discarding usage
     // reported by the failed attempt.
@@ -88,6 +94,7 @@ export async function* streamCompletion(
             partialCalls.clear();
             finishReason = undefined;
             usage = undefined;
+            scrubber.reset();
             Object.assign(stats, attemptStats);
             yield {
               type: 'llm_retry',
@@ -99,8 +106,15 @@ export async function* streamCompletion(
             break;
           }
           case 'text_delta': {
-            content += ev.text;
-            yield { type: 'text_delta', messageId, text: ev.text };
+            // Reasoning tags are removed HERE, at the storage boundary: the
+            // assistant message (and therefore the log, the reply and every
+            // later request) holds the visible answer only. A delta that is
+            // entirely reasoning yields nothing and is not re-emitted.
+            const visible = scrubber.feed(ev.text);
+            if (visible.length > 0) {
+              content += visible;
+              yield { type: 'text_delta', messageId, text: visible };
+            }
             break;
           }
           case 'reasoning_delta': {
@@ -160,6 +174,13 @@ export async function* streamCompletion(
       requeueUnaccounted(opts, notices);
       yield* finishAborted(opts);
       return { interrupted: true };
+    }
+    // Release prose the scrubber was holding back as a possible partial tag.
+    // After this the stream is over, so nothing can complete it.
+    const tail = scrubber.flush();
+    if (tail.length > 0) {
+      content += tail;
+      yield { type: 'text_delta', messageId, text: tail };
     }
     const emptyCompletion =
       content.length === 0 && partialCalls.size === 0 && finishReason !== undefined;

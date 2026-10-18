@@ -4,6 +4,7 @@ import type { AgentMessage, ChatProvider, ChatRequest, UserMessage } from './typ
 import type { Session, SessionEvent } from './session.js';
 import { COMPACT_SUMMARY_PREFIX, compactionSurface } from './session.js';
 import { isAbortMarker } from './agent/options.js';
+import { StreamingThinkScrubber } from './agent/think.js';
 import { errMessage } from './errors.js';
 import { estimateMessageTokens } from './estimate.js';
 import { newId } from './ids.js';
@@ -144,11 +145,26 @@ export async function compactConversation(
   };
   let summary = '';
   const req: ChatRequest = { messages: [askMsg], signal };
+  // The same reasoning filter the main stream uses: a summary carrying its own
+  // ` thinking` block would be stored, injected into every later request, and
+  // compounded by each iterative update.
+  const scrubber = new StreamingThinkScrubber();
   for await (const ev of client.stream(req)) {
     if (ev.type === 'text_delta') {
-      summary += ev.text;
-      onDelta?.(ev.text);
-    } else if (ev.type === 'reset') summary = ''; // retry replays from scratch
+      const visible = scrubber.feed(ev.text);
+      if (visible.length > 0) {
+        summary += visible;
+        onDelta?.(visible);
+      }
+    } else if (ev.type === 'reset') {
+      summary = ''; // retry replays from scratch
+      scrubber.reset();
+    }
+  }
+  const tail = scrubber.flush();
+  if (tail.length > 0) {
+    summary += tail;
+    onDelta?.(tail);
   }
   return summary.trim();
 }
