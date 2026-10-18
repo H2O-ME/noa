@@ -6,6 +6,7 @@
  * 与人格分开、永远在场，包括操作者写了 `SOUL.md` 之后。
  */
 import { describe, expect, it } from 'vitest';
+import { INTERJECTION_LABEL, INTERJECTION_OPEN } from '@noa/core';
 import {
   buildNoaSystemPrompt,
   NOA_HISTORY_NOTE,
@@ -57,5 +58,18 @@ describe('buildNoaSystemPrompt', () => {
     expect(prompt.startsWith('You are 小助手, a cat.')).toBe(true);
     expect(prompt).not.toContain('You are Noa');
     expect(prompt).toContain(NOA_HISTORY_NOTE);
+  });
+
+  it('names the mid-run marker the kernel actually writes', () => {
+    // 通道事实与内核机制必须在文本上对齐：提示词里说的那个标记，就是
+    // `@noa/core` 的 `formatInterjection` 真正写进消息的那个。两边各写一遍、各自演化，
+    // 就会出现「模型在等一个永远不会出现的标记」——而那种失配没有任何运行时报错。
+    // 提示词引的是标签（`[LABEL]` / `[/LABEL]`），开标记里还跟着一句说明，所以这里
+    // 断言的是标签，不是整句。
+    const prompt = buildNoaSystemPrompt();
+    expect(prompt).toContain(`[${INTERJECTION_LABEL}]`);
+    expect(prompt).toContain(`[/${INTERJECTION_LABEL}]`);
+    // 内核写出来的那一份必须真的以这个标签开头，否则上面两条只是自己跟自己对齐。
+    expect(INTERJECTION_OPEN.startsWith(`[${INTERJECTION_LABEL}`)).toBe(true);
   });
 });
