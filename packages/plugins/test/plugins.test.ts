@@ -424,11 +424,17 @@ describe('builtinPlugins', () => {
       await external.execute({ path: path.join(outsideDir, 'outside.txt') }, { rootDir: root }),
     ).toBe('secret');
 
-    // Writes stay sandboxed: out-of-root writes still reject.
+    // Writes are graded the same way now: out-of-root writes are `write-external`
+    // (approval-gated) instead of a hard refusal, and execute once allowed. The
+    // refusal used to read as a broken tool on a server-resident deployment, where
+    // the machine IS the operator's and `bash` was never confined by the root either.
     const externalWrite = host.tools.find((t) => t.name === 'write_file')!;
-    await expect(
-      externalWrite.execute({ path: path.join(outsideDir, 'x.txt'), content: 'no' }, { rootDir: root }),
-    ).rejects.toThrow(/escapes workspace root/);
+    expect(await externalWrite.permissionFor?.({ path: path.join(outsideDir, 'x.txt') })).toBe('write-external');
+    expect(await externalWrite.permissionFor?.({ path: 'inside.txt' })).toBe('write');
+    expect(
+      await externalWrite.execute({ path: path.join(outsideDir, 'x.txt'), content: 'ok' }, { rootDir: root }),
+    ).toContain('wrote 2 chars');
+    expect(await readFile(path.join(outsideDir, 'x.txt'), 'utf8')).toBe('ok');
   });
 });
 

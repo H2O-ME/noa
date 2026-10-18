@@ -58,6 +58,39 @@ export async function rootPermissionKind(
 }
 
 /**
+ * The write-side twin of {@link rootPermissionKind}: in-root writes are free,
+ * out-of-root writes are approval-gated.
+ *
+ * This is what replaced a hard refusal. `resolveInRoot` used to make an
+ * out-of-root write an ERROR, and the consequence was reported live on a
+ * server-resident deployment: the agent hit `path escapes workspace root`,
+ * told the user it would "use a path inside the workspace instead", and could
+ * not do the job it was asked to do — on a machine whose entire filesystem is
+ * the operator's own. A refusal that only the fs tools honor is not a security
+ * boundary anyway: `bash` runs a shell as the same user and was never confined
+ * by it (which is why `bash` is `execute`, not `write`).
+ *
+ * So the boundary becomes a review point instead of a wall: inside the root is
+ * the ordinary work an agent does unattended, outside it is a decision the
+ * reviewer sees first. The distinction stays load-bearing — it is exactly what
+ * makes the plain `write` kind safe to auto-allow.
+ *
+ * Any resolution failure fails closed to `write-external`, matching the read
+ * side: the gate is the conservative default.
+ * @param rootDir - the live workspace root.
+ * @param raw - the model-supplied path.
+ * @returns `write` inside the root, `write-external` outside it.
+ */
+export async function rootWriteKind(rootDir: string, raw: unknown): Promise<ToolPermissionKind> {
+  try {
+    const file = await resolveReal(rootDir, raw);
+    return (await isInsideRealRoot(rootDir, file)) ? 'write' : 'write-external';
+  } catch {
+    return 'write-external';
+  }
+}
+
+/**
  * Newline-tolerant replace: matches `oldString` treating every \n as \r?\n
  * (used after an exact match failed on a CRLF file). The replacement keeps
  * the file's CRLF habit when both sides are multi-line. Returns undefined
@@ -232,7 +265,9 @@ async function executeWriteFile(
   if (typeof args['content'] !== 'string') {
     return 'Error: content must be a string (write_file takes path + content)';
   }
-  const file = await resolveInRoot(c.rootDir, args['path']);
+  // `resolveReal`, not `resolveInRoot`: the gate has already decided whether this
+  // path was acceptable (see `rootWriteKind`), so the tool's job is to write it.
+  const file = await resolveReal(c.rootDir, args['path']);
   const content = args['content'];
   await atomicWrite(file, content);
   await recordVersionNow(file);
@@ -244,7 +279,7 @@ async function executeEditFile(
   args: Record<string, unknown>,
   c: ToolExecuteContext,
 ): Promise<string> {
-  const file = await resolveInRoot(c.rootDir, args['path']);
+  const file = await resolveReal(c.rootDir, args['path']);
   const oldString = strArg(args, 'old_string');
   const newString = strArg(args, 'new_string') ?? '';
   if (oldString === undefined || oldString.length === 0) return 'Error: old_string must be a non-empty string';
@@ -500,20 +535,29 @@ export function fsWritePlugin(options: { rootDir: () => string }): Plugin {
       registerTool(ctx, {
         name: 'write_file',
         description:
-          'Creates or overwrites a text file inside the workspace (parent directories are created). Args: path (required), content (required).',
+          'Creates or overwrites a text file (parent directories are created). Args: path (required), content (required).',
         parameters: {
           type: 'object',
           properties: {
-            path: { type: 'string', description: 'File path, workspace-relative or absolute inside the workspace root.' },
+            path: { type: 'string', description: 'File path, workspace-relative or absolute.' },
             content: { type: 'string', description: 'Full file content to write.' },
           },
           required: ['path', 'content'],
           additionalProperties: false,
         },
+        /**
+         * Graded per call, not statically: the same tool is free inside the
+         * workspace and reviewed outside it (see `rootWriteKind`). A throwing
+         * classifier would fail closed to `execute` in the registry, so this one
+         * never throws.
+         */
+        async permissionFor(args) {
+          return await rootWriteKind(rootDir(), args['path']);
+        },
         /** Show what an approval would actually write (read-only). */
         async preview(args) {
           try {
-            const file = await resolveInRoot(rootDir(), args['path']);
+            const file = await resolveReal(rootDir(), args['path']);
             const content = typeof args['content'] === 'string' ? args['content'] : '';
             const rel = path.relative(rootDir(), file) || file;
             const firstLine = (content.split('\n', 1)[0] ?? '').slice(0, 80);
@@ -536,11 +580,11 @@ export function fsWritePlugin(options: { rootDir: () => string }): Plugin {
       registerTool(ctx, {
         name: 'edit_file',
         description:
-          'Replaces an exact substring in a workspace text file. Args: path (required), old_string (required), new_string (required), replace_all (optional boolean). Fails if old_string is not found or appears multiple times without replace_all.',
+          'Replaces an exact substring in a text file. Args: path (required), old_string (required), new_string (required), replace_all (optional boolean). Fails if old_string is not found or appears multiple times without replace_all.',
         parameters: {
           type: 'object',
           properties: {
-            path: { type: 'string', description: 'File path, workspace-relative or absolute inside the workspace root.' },
+            path: { type: 'string', description: 'File path, workspace-relative or absolute.' },
             old_string: { type: 'string', description: 'Exact text to replace.' },
             new_string: { type: 'string', description: 'Replacement text.' },
             replace_all: { type: 'boolean', description: 'Replace every occurrence instead of failing on multiples.' },
@@ -548,13 +592,17 @@ export function fsWritePlugin(options: { rootDir: () => string }): Plugin {
           required: ['path', 'old_string', 'new_string'],
           additionalProperties: false,
         },
+        /** Same per-call grading as `write_file` (see `rootWriteKind`). */
+        async permissionFor(args) {
+          return await rootWriteKind(rootDir(), args['path']);
+        },
         /** Unified-ish diff shown above the approval prompt (read-only). */
         async preview(args) {
           let file: string;
           let oldString: string;
           let newString: string;
           try {
-            file = await resolveInRoot(rootDir(), args['path']);
+            file = await resolveReal(rootDir(), args['path']);
             oldString = strArg(args, 'old_string') ?? '';
             newString = strArg(args, 'new_string') ?? '';
             if (oldString.length === 0) return '';

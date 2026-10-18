@@ -212,8 +212,14 @@ describe('bash plugin', () => {
   }, 20_000);
 });
 
-describe('fs sandbox', () => {
-  it('write_file rejects a symlink pointing outside the workspace', async () => {
+describe('fs write boundary', () => {
+  it('grades a symlink pointing outside the workspace as an out-of-root write', async () => {
+    // The boundary is no longer a refusal (`resolveInRoot` used to throw
+    // `path escapes workspace root`, which read as a broken tool on a machine whose
+    // whole filesystem is the operator's). It is a REVIEW point instead — and that
+    // only works if the symlink is still seen for what it is. Containment is checked
+    // on CANONICAL paths, so a link inside the root pointing outside cannot
+    // masquerade as an ordinary in-root write.
     const root = await mkdtemp(path.join(tmpdir(), 'nova-fs-'));
     const outside = await mkdtemp(path.join(tmpdir(), 'nova-outside-'));
     const link = path.join(root, 'escape');
@@ -227,13 +233,30 @@ describe('fs sandbox', () => {
     const host = await fsHostAt(root);
     const write = host.tools.find((t) => t.name === 'write_file')!;
 
-    await expect(write.execute({ path: 'escape/pwned.txt', content: 'x' }, { rootDir: root })).rejects.toThrow(
-      /escapes workspace root/,
+    // An ordinary in-root path stays free; the linked one does not.
+    expect(await write.permissionFor?.({ path: 'inside.txt', content: 'x' }, { rootDir: root })).toBe('write');
+    expect(await write.permissionFor?.({ path: 'escape/pwned.txt', content: 'x' }, { rootDir: root })).toBe(
+      'write-external',
     );
-    // The real target must not have been created through the link.
-    expect(await readFile(path.join(outside, 'pwned.txt'), 'utf8').catch(() => undefined)).toBeUndefined();
   });
 
+  it('writes outside the workspace once the gate has allowed it', async () => {
+    // What the gate allowed, the tool must actually do: a reviewed `write-external`
+    // that then failed with a containment error would make the review pointless.
+    const root = await mkdtemp(path.join(tmpdir(), 'nova-fs-'));
+    const outside = await mkdtemp(path.join(tmpdir(), 'nova-outside-'));
+    const target = path.join(outside, 'pwned.txt');
+    const host = await fsHostAt(root);
+    const write = host.tools.find((t) => t.name === 'write_file')!;
+
+    const result = await write.execute({ path: target, content: 'x' }, { rootDir: root });
+
+    expect(result).toContain('wrote 1 chars');
+    expect(await readFile(target, 'utf8')).toBe('x');
+  });
+});
+
+describe('fs sandbox', () => {
   it('read_file names the closest workspace path when the path is one segment short', async () => {
     // The observed miss (2026-10-01): a mention `@repo/docs/agents_md.md` was
     // read as `docs/agents_md.md`, the model then combed the tree for four more

@@ -129,9 +129,12 @@ export class PermissionService {
   private autoAllows(kind: PermissionKind): boolean {
     if (this.mode === 'full') return true;
     if (kind === 'read') return true;
-    // In-workspace writes are the ordinary way a coding agent works; the fs
-    // tools cannot write outside the root anyway (resolveInRoot refuses), so
-    // there is nothing here for the gate to weigh.
+    // In-workspace writes are the ordinary way a coding agent works, and the
+    // workspace is the operator's own project directory: there is nothing here
+    // for the gate to weigh. This stays honest only because `write-external`
+    // exists — the fs write tools grade each call against the root
+    // (`rootWriteKind`), so a path that leaves the workspace arrives below as a
+    // DIFFERENT kind rather than as a `write`.
     if (kind === 'write') return true;
     // 联网**读**：抓一个 URL 改不了这台机器上的任何东西，而「查一下」正是操作者要的事。
     // 把它挡在闸门后，等于每一次查资料都把整轮运行停住等一张卡 —— 对一个无人值守、只在
@@ -152,8 +155,15 @@ export class PermissionService {
     // 注意这条只管**读**：将来若有会**发送**数据的联网工具（上传、发帖、改远端状态），
     // 那属于 `execute` 那一类，不要复用这个种类。
     if (kind === 'network') return true;
-    // `read-external` reaches into the operator's own files outside the
-    // workspace, and `execute` can do anything: both go to the gate in `auto`.
+    // `read-external` and `write-external` reach into the operator's own files
+    // outside the workspace, and `execute` can do anything: all three go to the
+    // gate in `auto`.
+    //
+    // `write-external` is the one that used to be a hard refusal instead (the fs
+    // tools threw `path escapes workspace root`). That read as a broken tool on a
+    // server-resident deployment, where the machine IS the operator's and the
+    // "wall" was never real — `bash` runs as the same user and was never confined
+    // by it. Reviewed-not-refused is the honest version of the same boundary.
     return false;
   }
 
