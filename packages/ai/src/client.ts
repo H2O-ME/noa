@@ -15,6 +15,10 @@
  *   error chunks, streams that end without a finish reason) retry within the
  *   same budget — after partial output a `reset` event lets consumers discard
  *   their in-flight state before the retry replays from scratch.
+ * - The SAME `reset` contract covers the second axis of failure, the ENDPOINT:
+ *   when one host cannot serve the request at all (a terminal 401/403/404, or a
+ *   retry budget spent on a 429) the stream moves to the next configured
+ *   fallback and replays there, inside the one request.
  */
 import type { ChatProvider, ChatRequest, StreamEvent, ToolDefinition } from '@noa/core';
 import {
@@ -32,10 +36,33 @@ import { parseSse } from './sse.js';
 import { keepAlive, readBoundedText } from './transport.js';
 import { translateChunk, toProviderMessage, toProviderTool, type ProviderChunk } from './wire.js';
 
+/**
+ * A second endpoint to try when the primary one is unusable.
+ *
+ * Deliberately just an endpoint: same protocol, same request body shape, same
+ * tool wire format — so a fallback is not "another provider", it is another
+ * address for the same conversation. `model` is optional because the common case
+ * is "the same model served by a different host or account"; name it only when
+ * the two endpoints spell the id differently.
+ */
+export interface ProviderFallback {
+  baseURL: string;
+  apiKey: string;
+  /** Model id as THIS endpoint spells it; defaults to the primary's. */
+  model?: string;
+}
+
 export interface OpenAICompatConfig {
   baseURL: string;
   apiKey: string;
   model: string;
+  /**
+   * Endpoints to fall back to, in order, when the primary fails terminally
+   * (401/403/404 — the request itself is rejected, so re-asking the same host
+   * cannot help) or spends its whole retry budget (rate limit, quota, a host
+   * that is simply down). See {@link OpenAICompatClient.stream}.
+   */
+  fallbacks?: readonly ProviderFallback[];
   /** Injectable for tests; defaults to global fetch. */
   fetchImpl?: typeof fetch;
   /** Retries for 429/5xx/network errors before the stream starts. Default 3. */
@@ -72,12 +99,33 @@ interface RequestTarget {
 /** Cap for an error response body read into a message (a bad gateway may not end). */
 const ERROR_BODY_MAX_BYTES = 64 * 1024;
 
+/**
+ * How long a failed primary keeps losing the FIRST attempt to the fallbacks.
+ *
+ * A terminal rejection (401) or an exhausted retry budget says the endpoint is
+ * bad NOW; making every subsequent request rediscover that costs a full attempt
+ * plus its backoff, and on a rate limit it costs another rejection. The window
+ * is short because it is a guess about a transient condition, not a verdict:
+ * once it lapses the primary is tried first again, so a recovered endpoint is
+ * picked back up without a restart.
+ */
+const PRIMARY_COOLDOWN_MS = 60_000;
+
+/** One endpoint in the order a single request will try them. */
+interface PlannedTarget {
+  target: RequestTarget;
+  primary: boolean;
+}
+
 export class OpenAICompatClient implements ChatProvider {
   private readonly config: OpenAICompatConfig;
   private readonly fetchImpl: typeof fetch;
   private readonly maxRetries: number;
   private readonly retryBaseDelayMs: number;
   private readonly timeoutMs: number;
+  private readonly fallbacks: readonly ProviderFallback[];
+  /** Epoch ms until which later requests try the fallbacks before the primary. */
+  private primaryCooldownUntil = 0;
   private requestSeq = 0;
   /**
    * Wire-format tool array cached by the input array's identity. The caller
@@ -95,6 +143,14 @@ export class OpenAICompatClient implements ChatProvider {
     this.maxRetries = config.maxRetries ?? 3;
     this.retryBaseDelayMs = config.retryBaseDelayMs ?? 500;
     this.timeoutMs = config.timeoutMs ?? 120_000;
+    // A fallback that repeats the primary is not a fallback: it would spend the
+    // same failing address twice and report the failure as if it had tried
+    // something else. Dropped here rather than at the config schema because the
+    // comparison is on the RESOLVED endpoint (env refs expanded, `model`
+    // defaulted), which only this constructor sees.
+    this.fallbacks = (config.fallbacks ?? []).filter(
+      (f) => f.baseURL !== config.baseURL || f.apiKey !== config.apiKey || (f.model ?? config.model) !== config.model,
+    );
   }
 
   get model(): string {
@@ -130,6 +186,9 @@ export class OpenAICompatClient implements ChatProvider {
     this.config.baseURL = endpoint.baseURL;
     this.config.apiKey = endpoint.apiKey;
     this.config.model = endpoint.model;
+    // A different endpoint has no failure history yet, so the previous
+    // endpoint's cooldown must not bias the first request to this one.
+    this.primaryCooldownUntil = 0;
     if (endpoint.temperature !== undefined) this.config.temperature = endpoint.temperature;
     else delete this.config.temperature;
     if (endpoint.maxTokens !== undefined) this.config.maxTokens = endpoint.maxTokens;
@@ -145,17 +204,95 @@ export class OpenAICompatClient implements ChatProvider {
     this.config.sessionId = sessionId;
   }
 
-  async *stream(req: ChatRequest): AsyncGenerator<StreamEvent> {
-    // Freeze the request TARGET for the whole stream. A model/provider switch
-    // (setModel / setEndpoint) landing between attempts must apply to the NEXT
-    // stream, not re-point an in-flight retry at a different endpoint while the
-    // body still names the previous model.
-    const target: RequestTarget = {
+  /**
+   * The endpoints ONE request will try, in order.
+   *
+   * The primary comes first, except inside the cooldown window left by its own
+   * recent failure — then the fallbacks go first and the primary is still in the
+   * list, LAST. Keeping it in the list is what makes the cooldown a preference
+   * rather than a verdict: if every fallback fails too, the request still ends
+   * with the primary's error rather than "no endpoints", and the moment the
+   * window lapses the primary leads again.
+   */
+  private targetPlan(): PlannedTarget[] {
+    const primary: RequestTarget = {
       baseURL: this.config.baseURL,
       apiKey: this.config.apiKey,
       model: this.config.model,
       sessionId: this.config.sessionId,
     };
+    const plan: PlannedTarget[] = [{ target: primary, primary: true }];
+    for (const fallback of this.fallbacks) {
+      plan.push({
+        target: {
+          baseURL: fallback.baseURL,
+          apiKey: fallback.apiKey,
+          model: fallback.model ?? this.config.model,
+          sessionId: this.config.sessionId,
+        },
+        primary: false,
+      });
+    }
+    if (plan.length > 1 && Date.now() < this.primaryCooldownUntil) {
+      const [head, ...rest] = plan;
+      return [...rest, head!];
+    }
+    return plan;
+  }
+
+  async *stream(req: ChatRequest): AsyncGenerator<StreamEvent> {
+    const plan = this.targetPlan();
+    let lastError: unknown;
+    // Whether the CURRENT target produced anything before it failed. A target
+    // that fails before its first event is invisible to the consumer (the next
+    // one replays from an identical clean slate); after partial output the
+    // consumer must be told to drop it — the same `reset` contract as an
+    // in-target retry, because it is the same situation.
+    let yielded = false;
+    for (let i = 0; i < plan.length; i += 1) {
+      const step = plan[i]!;
+      const next = plan[i + 1];
+      try {
+        for await (const ev of this.streamVia(step.target, req)) {
+          yielded = true;
+          yield ev;
+        }
+        // Served. A primary that works clears the cooldown — that is the whole
+        // "come back to the primary" path.
+        if (step.primary) this.primaryCooldownUntil = 0;
+        return;
+      } catch (err) {
+        if (isAbortError(err) || req.signal?.aborted) throw abortError();
+        lastError = err;
+        if (next === undefined) break;
+        if (yielded) {
+          yield {
+            type: 'reset',
+            attempt: i + 2,
+            maxRetries: this.maxRetries,
+            // Naming the failed endpoint is the point: without it an operator
+            // reading `llm_retry` cannot tell a bad host from a bad request.
+            error: `${step.target.baseURL}: ${errMessage(err)}`,
+          };
+          yielded = false;
+        }
+        // Only the primary has a fallback to be preferred over, so only the
+        // primary earns a cooldown. A failed fallback is just the next entry.
+        if (step.primary) this.primaryCooldownUntil = Date.now() + PRIMARY_COOLDOWN_MS;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  /**
+   * ONE endpoint's whole retry budget: every attempt against `target`, retrying
+   * in place, until it serves the stream or gives up (throws). Giving up is what
+   * moves {@link stream} to the next endpoint — so a terminal failure (which
+   * `isRetryableError` refuses to retry) hands over immediately, while a rate
+   * limit spends the budget here first, because the SAME host is the most likely
+   * place for the next attempt to succeed.
+   */
+  private async *streamVia(target: RequestTarget, req: ChatRequest): AsyncGenerator<StreamEvent> {
     const body = this.buildBody(req, target);
     let lastError: unknown;
 

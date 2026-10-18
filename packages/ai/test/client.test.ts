@@ -57,6 +57,47 @@ async function drain(stream: AsyncIterable<StreamEvent>): Promise<StreamEvent[]>
   return events;
 }
 
+/** The primary at `https://example.test/v1` plus one fallback, recording calls. */
+function failoverClient(
+  fetchImpl: typeof fetch,
+  fallback: { baseURL: string; apiKey: string; model?: string } = {
+    baseURL: 'https://backup.test/v1',
+    apiKey: 'sk-backup',
+  },
+): OpenAICompatClient {
+  return new OpenAICompatClient({
+    baseURL: 'https://example.test/v1',
+    apiKey: 'sk-test',
+    model: 'test-model',
+    fallbacks: [fallback],
+    fetchImpl,
+    retryBaseDelayMs: 1,
+  });
+}
+
+/** A recording fetchImpl: answers by URL, counting every call. */
+function byUrl(handlers: Record<string, () => Response | Promise<Response>>): {
+  impl: typeof fetch;
+  calls: string[];
+  bodies: Record<string, unknown>[];
+  keys: string[];
+} {
+  const calls: string[] = [];
+  const bodies: Record<string, unknown>[] = [];
+  const keys: string[] = [];
+  const impl: typeof fetch = (input, init) => {
+    const url = String(input);
+    calls.push(url);
+    const handler = handlers[url];
+    if (handler === undefined) return Promise.resolve(new Response('no handler', { status: 500 }));
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    keys.push(headers['authorization'] ?? '');
+    if (typeof init?.body === 'string') bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+    return Promise.resolve(handler());
+  };
+  return { impl, calls, bodies, keys };
+}
+
 describe('OpenAICompatClient', () => {
   it('translates SSE chunks into stream events including usage', async () => {
     const client = clientWith(() => Promise.resolve(sseResponse(SSE_BODY)));
@@ -353,6 +394,167 @@ describe('OpenAICompatClient', () => {
     await drain(client.stream({ messages: [], tools: toolsClone }));
     const body3 = JSON.parse(String(seenBodies[2]!.body)) as { tools: unknown[] };
     expect(body3.tools).toEqual(body1.tools);
+  });
+});
+
+describe('endpoint fallback', () => {
+  const PRIMARY = 'https://example.test/v1/chat/completions';
+  const BACKUP = 'https://backup.test/v1/chat/completions';
+  const ok = (): Response =>
+    sseResponse('data: {"choices":[{"delta":{"content":"served"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+
+  it('switches to the fallback on a terminal failure, inside the same request', async () => {
+    const rec = byUrl({
+      [PRIMARY]: () => new Response('{"error":{"message":"invalid api key"}}', { status: 401 }),
+      [BACKUP]: ok,
+    });
+    const client = failoverClient(rec.impl);
+    const events = await drain(client.stream({ messages: [] }));
+
+    // A 401 is terminal — retrying the SAME host cannot fix a rejected key, so
+    // the primary is tried exactly once and the budget moves to the fallback.
+    expect(rec.calls).toEqual([PRIMARY, BACKUP]);
+    expect(events.some((e) => e.type === 'text_delta' && e.text === 'served')).toBe(true);
+  });
+
+  it('switches to the fallback after the retry budget is spent (a rate-limited primary)', async () => {
+    const rec = byUrl({
+      [PRIMARY]: () => new Response(null, { status: 429 }),
+      [BACKUP]: ok,
+    });
+    const client = failoverClient(rec.impl);
+    const events = await drain(client.stream({ messages: [] }));
+
+    // A 429 IS worth retrying, so the same host gets the whole budget first —
+    // it is the most likely place for the next attempt to succeed.
+    expect(rec.calls.filter((u) => u === PRIMARY)).toHaveLength(4); // 1 + maxRetries(3)
+    expect(rec.calls.at(-1)).toBe(BACKUP);
+    expect(events.some((e) => e.type === 'text_delta' && e.text === 'served')).toBe(true);
+  });
+
+  it('addresses the fallback with its own key, and its model only when it names one', async () => {
+    const rec = byUrl({
+      [PRIMARY]: () => new Response(null, { status: 403 }),
+      [BACKUP]: ok,
+    });
+    const client = failoverClient(rec.impl, {
+      baseURL: 'https://backup.test/v1',
+      apiKey: 'sk-backup',
+      model: 'backup-model',
+    });
+    await drain(client.stream({ messages: [] }));
+
+    expect(rec.keys).toEqual(['Bearer sk-test', 'Bearer sk-backup']);
+    // The body is rebuilt per endpoint, so the model id follows the endpoint.
+    expect(rec.bodies.map((b) => b['model'])).toEqual(['test-model', 'backup-model']);
+  });
+
+  it('defaults the fallback model to the primary\'s when the fallback names none', async () => {
+    const rec = byUrl({
+      [PRIMARY]: () => new Response(null, { status: 404 }),
+      [BACKUP]: ok,
+    });
+    const client = failoverClient(rec.impl);
+    await drain(client.stream({ messages: [] }));
+    expect(rec.bodies.map((b) => b['model'])).toEqual(['test-model', 'test-model']);
+  });
+
+  it('announces a mid-reply switch with a reset naming the failed endpoint', async () => {
+    const rec = byUrl({
+      // Every attempt on the primary delivers a partial reply and then dies.
+      [PRIMARY]: () => failingSseResponse('data: {"choices":[{"delta":{"content":"par"}}]}\n\n'),
+      [BACKUP]: ok,
+    });
+    const client = failoverClient(rec.impl);
+    const events = await drain(client.stream({ messages: [] }));
+
+    const resets = events.filter((e): e is Extract<StreamEvent, { type: 'reset' }> => e.type === 'reset');
+    // 3 in-target retries + 1 for the endpoint switch itself.
+    expect(resets).toHaveLength(4);
+    // The last one is the switch, and it names WHERE the failure was: without
+    // the host an operator cannot tell a bad endpoint from a bad request.
+    expect(resets.at(-1)?.error).toContain('https://example.test/v1');
+    // Every primary attempt replayed from scratch, and only the fallback's reply
+    // survived — that is what the reset contract buys.
+    expect(
+      events.filter((e): e is Extract<StreamEvent, { type: 'text_delta' }> => e.type === 'text_delta').map((e) => e.text),
+    ).toEqual(['par', 'par', 'par', 'par', 'served']);
+  });
+
+  it('prefers the fallback for later requests while the primary is in cooldown', async () => {
+    let backupMode: 'ok' | 'fail' = 'ok';
+    const rec = byUrl({
+      [PRIMARY]: () => new Response(null, { status: 401 }),
+      [BACKUP]: () => (backupMode === 'ok' ? ok() : new Response(null, { status: 500 })),
+    });
+    const client = failoverClient(rec.impl);
+    await drain(client.stream({ messages: [] }));
+    expect(rec.calls).toEqual([PRIMARY, BACKUP]);
+
+    // Second request: the primary just failed, so the known-good fallback takes
+    // the first attempt and the primary is not re-hit at all.
+    rec.calls.length = 0;
+    await drain(client.stream({ messages: [] }));
+    expect(rec.calls).toEqual([BACKUP]);
+  });
+
+  it('returns to the primary once it serves, and keeps it as the last resort meanwhile', async () => {
+    let primaryMode: 'fail' | 'ok' = 'fail';
+    let backupMode: 'ok' | 'fail' = 'ok';
+    const rec = byUrl({
+      [PRIMARY]: () => (primaryMode === 'ok' ? ok() : new Response(null, { status: 401 })),
+      [BACKUP]: () => (backupMode === 'ok' ? ok() : new Response(null, { status: 401 })),
+    });
+    const client = failoverClient(rec.impl);
+    await drain(client.stream({ messages: [] }));
+    expect(rec.calls).toEqual([PRIMARY, BACKUP]);
+
+    // While cooling down the primary is still IN the plan, last — so a fallback
+    // that also fails ends with the primary's error instead of "no endpoints".
+    rec.calls.length = 0;
+    backupMode = 'fail';
+    primaryMode = 'ok';
+    await drain(client.stream({ messages: [] }));
+    expect(rec.calls).toEqual([BACKUP, PRIMARY]);
+
+    // The primary served that request, so it leads again.
+    rec.calls.length = 0;
+    await drain(client.stream({ messages: [] }));
+    expect(rec.calls).toEqual([PRIMARY]);
+  });
+
+  it('reports the last endpoint\'s error when every endpoint fails', async () => {
+    const rec = byUrl({
+      [PRIMARY]: () => new Response('{"error":{"message":"primary down"}}', { status: 401 }),
+      [BACKUP]: () => new Response('{"error":{"message":"backup down"}}', { status: 401 }),
+    });
+    const client = failoverClient(rec.impl);
+    await expect(drain(client.stream({ messages: [] }))).rejects.toThrow('backup down');
+    expect(rec.calls).toEqual([PRIMARY, BACKUP]);
+  });
+
+  it('drops a fallback that repeats the primary instead of spending it twice', async () => {
+    const rec = byUrl({ [PRIMARY]: () => new Response(null, { status: 401 }) });
+    const client = failoverClient(rec.impl, {
+      baseURL: 'https://example.test/v1',
+      apiKey: 'sk-test',
+    });
+    await expect(drain(client.stream({ messages: [] }))).rejects.toThrow('HTTP 401');
+    expect(rec.calls).toEqual([PRIMARY]);
+  });
+
+  it('does not switch endpoints when the caller aborted', async () => {
+    const controller = new AbortController();
+    const rec = byUrl({
+      [PRIMARY]: () => {
+        controller.abort();
+        return new Response(null, { status: 401 });
+      },
+      [BACKUP]: ok,
+    });
+    const client = failoverClient(rec.impl);
+    await expect(drain(client.stream({ messages: [], signal: controller.signal }))).rejects.toThrow();
+    expect(rec.calls).toEqual([PRIMARY]);
   });
 });
 
