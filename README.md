@@ -41,6 +41,7 @@ pnpm workspace，8 个包，依赖严格单向：
 - **一切皆插件**：`plugins.entries[] = { id, enabled, config }` 是唯一开关，一行就是一个插件；行的 `config` 由**该插件自己的 schema** 校验，宿主不认识任何插件名。
 - **单一装配点**：`createAgentKernel()`，壳只负责 argv / 配置 / 生命周期。
 - **数据全在 `~/.noa/`**（`config.json` / `sessions/` / `plugins/` / `cache/`），**工作区目录零写入**。
+- **推理标签不外泄**：有些端点不把思考放进 `reasoning_content`，而是当普通 `content` 流出来（同一个网关上 `MiMo-V2.6-Flash` 如此、`DeepSeek-V4-Flash` 不如此）。内核在 assistant 消息的存储边界把它剥掉——流式路径用状态机（半个标签扣到边界再定，逐 delta 跑正则会漏），标题 / 审批 / 摘要三处一次性调用各剥一次。所以机器人回给你的永远是答案，不是草稿纸。
 
 ## 配置
 
