@@ -55,8 +55,9 @@ import type {
 import { EventPump } from './pump.js';
 import { HumanAskSeam } from './human-ask.js';
 import { CompactionRunner } from './compaction-runner.js';
-import { PromptQueue } from './prompt-queue.js';
+import { PromptQueue, type QueuedPrompt } from './prompt-queue.js';
 import { RunMeter } from './metrics.js';
+import { formatInterjection } from '../interjection.js';
 import type { KernelEvent, NoticeCode, TurnPhase } from './protocol.js';
 import { createAnchors, lastLoggedUsage, resetAnchors, type UsageAnchorState } from './usage-anchor.js';
 
@@ -460,15 +461,7 @@ export class AgentSession {
     // Read BEFORE the push: whether this is the conversation's opening prompt is
     // "no real user message yet", and after the push it never is.
     const opening = !this.deps.messages.some((m) => m.role === 'user' && !isContextFragment(m));
-    const userMsg: UserMessage = {
-      id: newId('msg'),
-      ts: Date.now(),
-      role: 'user',
-      content: text,
-      // Absent rather than empty when there are none: a text-only log must stay
-      // byte-identical to what it was before images existed.
-      ...(images === undefined || images.length === 0 ? {} : { images }),
-    };
+    const userMsg = this.userMessage(text, images);
     // Log FIRST, then the live surface (the same write-then-memory order
     // `appendEvent` follows): if the append fails, the transcript must not show
     // a message the durable log never received — a divergence that survives
@@ -506,6 +499,85 @@ export class AgentSession {
       return;
     }
     void this.runLoop();
+  }
+
+  /**
+   * 把一条消息插进**正在跑的那一轮**，而不是让它等下一轮。
+   *
+   * 这是「人在你干活的时候又说了句话」的落点。它和 `prompt()` 的区别只有一条：
+   * 消息落到一个已经在跑的轮次里，那一轮的下一次请求就会读到它（内核的
+   * `messages` 数组是共享引用，见 `prompt-queue.ts` 的文件头）。所以这条路径**不
+   * 启动任何东西**——没有新 run、没有新循环，只是把话放进模型下次一定会读到的地方。
+   *
+   * ## 为什么整个方法是同步的
+   *
+   * 判断「有没有在跑」、把消息推进 `messages`、往队列里记一格——这三件事之间**不能
+   * 有 await**。装配发生在运行循环的 await 点上；如果这三步之间存在挂起点，一次装配
+   * 就可能挤在中间，读到「消息已经在数组里、但队列还没有这一格」的状态：那一格会在
+   * 下一次装配被当作已读吸收掉（`recordAssembly` 按计数吸收），而这一次请求里并没有
+   * 这条消息——**插话从此消失**，而且一声不响。同步执行让这三步对外是一个原子动作，
+   * 于是无论装配落在它前面还是后面，两边都自洽。
+   *
+   * 因此持久写入（`session.append`）被放到同步块**之后**，失败时回滚。这与
+   * `runAgent` 生成的消息走的是同一条路（`commit()`：先 push、失败再按身份撤回），
+   * 不是新引入的顺序。
+   *
+   * ## 为什么不顺手打断
+   *
+   * 一轮里可能已经跑过 bash、写过文件。打断等于把已经发生的副作用留在原地却不再解释
+   * 它们——用户拿到的是一个半截的世界加一句「已取消」。插话是第三个选项，也是唯一
+   * 一个既不失礼也不丢工作的：话进得去，活儿接着干。真要立刻停下，`/stop` 是点名的
+   * 那条路（`abort()`），它仍然照旧。
+   *
+   * @param text - 用户原话（未加标记，标记在这里加）。
+   * @param images - 随这条消息来的图片；无则缺省。
+   * @returns true 表示已插进在跑的那一轮；false 表示没有在跑的轮次（调用方按普通
+   *   消息走队列），或会话已关。
+   */
+  interject(text: string, images?: readonly ImageAttachmentRef[]): boolean {
+    if (this.closed || !this.running) return false;
+    const userMsg = this.userMessage(formatInterjection(text), images);
+    this.deps.messages.push(userMsg);
+    this.publish({ type: 'user_message', message: userMsg });
+    // 队列里的那一格存**用户原话**：队列泳道是给人看的，标记是给模型的。
+    const entry = this.pending.enqueue(text);
+    this.publish({ type: 'queue_update', items: this.pending.items });
+    void this.persistInterjection(userMsg, entry);
+    return true;
+  }
+
+  /**
+   * 把插话写进持久日志；写不进去就把它在内存里也撤掉。
+   *
+   * 日志是事实（`commit()` 的同一条不变量）：一条日志从没收到过的消息不能留在
+   * `messages` 里，否则模型这次读到的东西和重启后读到的历史不是同一份。触发器必须
+   * 跟着一起收回——留着它会让会话为一条已经不在历史里的消息再跑一轮，那一轮装配出的
+   * 请求里根本没有这条消息，比撤回更糟。而这里**不抛**：插话的失败不该把正在跑的
+   * 那一轮一起带走。
+   */
+  private async persistInterjection(message: UserMessage, entry: QueuedPrompt): Promise<void> {
+    try {
+      await this.deps.session.append(message);
+    } catch (err) {
+      const at = this.deps.messages.indexOf(message);
+      if (at >= 0) this.deps.messages.splice(at, 1);
+      if (this.pending.withdraw(entry)) this.publish({ type: 'queue_update', items: this.pending.items });
+      const code: NoticeCode = 'interject_undelivered';
+      this.publish({ type: 'notice', code, text: `中途插话没能写进日志，已撤回：${errMessage(err)}` });
+    }
+  }
+
+  /** Build a user message in the one shape the log and the surface both accept. */
+  private userMessage(content: string, images?: readonly ImageAttachmentRef[]): UserMessage {
+    return {
+      id: newId('msg'),
+      ts: Date.now(),
+      role: 'user',
+      content,
+      // Absent rather than empty when there are none: a text-only log must stay
+      // byte-identical to what it was before images existed.
+      ...(images === undefined || images.length === 0 ? {} : { images }),
+    };
   }
 
   /**

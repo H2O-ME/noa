@@ -41,7 +41,7 @@
  */
 
 /** One queued trigger: the text for the queue lane, plus its assembly watermark. */
-interface QueuedPrompt {
+export interface QueuedPrompt {
   readonly text: string;
   /** The assembly count when this prompt was committed (see `recordAssembly`). */
   readonly enqueuedAt: number;
@@ -73,8 +73,32 @@ export class PromptQueue {
   }
 
   /** Record a committed prompt that still needs a run. */
-  enqueue(text: string): void {
-    this.entries.push({ text, enqueuedAt: this.assemblies });
+  enqueue(text: string): QueuedPrompt {
+    const entry: QueuedPrompt = { text, enqueuedAt: this.assemblies };
+    this.entries.push(entry);
+    return entry;
+  }
+
+  /**
+   * Take back one trigger BY IDENTITY, without running it.
+   *
+   * The one caller is a mid-run interjection whose durable append failed: the
+   * message is removed from the live surface (the log is the truth), and this
+   * removes the matching trigger with it. Leaving the trigger behind would start
+   * a run for a prompt that is no longer in the history — a run that assembles a
+   * request containing no such message, which is worse than either outcome.
+   *
+   * By identity and not by text: the same words may legitimately be queued twice
+   * (the operator sent the same line twice), and withdrawing both would silently
+   * drop a message that is in the log.
+   * @param entry - the handle `enqueue` returned.
+   * @returns whether the queue changed, so the caller publishes only on change.
+   */
+  withdraw(entry: QueuedPrompt): boolean {
+    const at = this.entries.indexOf(entry);
+    if (at < 0) return false;
+    this.entries.splice(at, 1);
+    return true;
   }
 
   /**

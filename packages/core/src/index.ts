@@ -6,6 +6,7 @@ export * from './text.js';
 export * from './utf8.js';
 export * from './agent.js';
 export * from './request-trim.js';
+export * from './interjection.js';
 export * from './session/session-projection.js';
 export * from './goal.js';
 export * from './session.js';

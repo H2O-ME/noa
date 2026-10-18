@@ -45,7 +45,12 @@ export type NoticeCode =
   /** A surface's event consumer fell behind MAX_LAG and its window was reset. */
   | 'surface_lagged'
   /** A subscribed event listener threw. Reported instead of crashing the run. */
-  | 'listener_failed';
+  | 'listener_failed'
+  /**
+   * 一条中途插话没能写进持久日志，已从内存里撤回（`AgentSession.interject`）。
+   * 必须报出来：用户以为那句话已经交给正在跑的那一轮了，而它其实不在历史里。
+   */
+  | 'interject_undelivered';
 
 /** A compaction pass, start → done|error, with the outcome bits a surface renders. */
 export interface CompactionProgress {
