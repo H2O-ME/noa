@@ -12,7 +12,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { AskUserQuestionItem } from '@noa/core';
-import { QqOutbox, NARRATION_ALLOWANCE, WINDOW_ALLOWANCE } from '../src/outbox.js';
+import { QqOutbox, INTERACTION_ALLOWANCE, NARRATION_ALLOWANCE, WINDOW_ALLOWANCE } from '../src/outbox.js';
 import { layoutQuestions, renderQuestions } from '../src/question-reply.js';
 import { parseAnswer } from '../src/question-answer.js';
 import { parseRemoteCommand, remoteBypassesQueue } from '../src/remote-parse.js';
@@ -55,8 +55,13 @@ describe('the outbox owns the window and the allowance', () => {
   });
 
   it('enforces the platform bound on the reply too, and says so', async () => {
-    const { outbox, sent } = rig({ narrationAllowance: 5 });
-    for (let i = 0; i < WINDOW_ALLOWANCE; i++) outbox.narrate(PEER, `进展 ${i}`);
+    // 通知那一层有上限（而且留了回复的名额），回复自己则没有「通知」那层限制：同一个
+    // 窗口里多条回复——一个 `/answer` 旁路、一张回执——能把平台的上限用满。此时必须
+    // 如实拒绝，而不是发进平台自己的边界里等它失败。
+    const { outbox, sent } = rig();
+    for (let i = 0; i < WINDOW_ALLOWANCE; i++) {
+      expect((await outbox.reply(PEER, `答 ${i}`)).ok).toBe(true);
+    }
     const refused = await outbox.reply(PEER, '结论');
     expect(refused.ok).toBe(false);
     expect(refused.reason).toContain('reply allowance spent');
@@ -78,11 +83,11 @@ describe('the outbox owns the window and the allowance', () => {
   });
 
   it('lets a card through after progress lines have spent the narration cap', () => {
-    // The live failure, in one test: a turn touched three tools, three progress
-    // lines spent the narration cap exactly (`PROGRESS_MAX_UPDATES` and
-    // `NARRATION_ALLOWANCE` are both 3), and the approval card — the one message the
-    // whole run was stopped on — was refused by that same cap. Nothing appeared in
-    // the chat, so nothing could be clicked, and the approval died on its timer
+    // The live failure, in one test: a turn touched three tools, the progress lines
+    // spent the narration cap exactly (`PROGRESS_MAX_UPDATES` and
+    // `NARRATION_ALLOWANCE` are both 2 now), and the approval card — the one message
+    // the whole run was stopped on — was refused by that same cap. Nothing appeared
+    // in the chat, so nothing could be clicked, and the approval died on its timer
     // reporting that the peer had not answered a question they never received.
     const { outbox, sent } = rig();
     for (let i = 0; i < NARRATION_ALLOWANCE; i++) outbox.narrate(PEER, `正在: 工具 ${i}`);
@@ -93,13 +98,40 @@ describe('the outbox owns the window and the allowance', () => {
     expect(sent.map((entry) => entry.content)).toContain('**需要审批：bash**');
   });
 
+  it('keeps two slots for cards no matter how much narration a turn wants', () => {
+    // 这是那台机器上真实发生的形状：一轮里播报 3 条（旧上限）+ 审批卡 + 提问卡，
+    // 而提问卡被拒。现在叙述和互动各有计数器，且叙述被额外限制在互动预留之外——
+    // 最坏情况 2 播报 + 2 卡片 + 1 回复 = 5，正好是平台上限。
+    const { outbox, sent } = rig();
+    for (let i = 0; i < NARRATION_ALLOWANCE + 5; i++) outbox.narrate(PEER, `进展 ${i}`);
+    expect(sent).toHaveLength(NARRATION_ALLOWANCE);
+
+    expect(outbox.narrate(PEER, '卡片 A', undefined, 'interaction')).toEqual({ ok: true });
+    expect(outbox.narrate(PEER, '卡片 B', undefined, 'interaction')).toEqual({ ok: true });
+    const third = outbox.narrate(PEER, '卡片 C', undefined, 'interaction');
+    expect(third.ok).toBe(false);
+    expect(third.reason).toContain('interaction allowance spent');
+
+    // 播报**不能**动预留：把叙述上限调高就能看到真正起作用的那条约束是预留，
+    // 而不是叙述自己的上限——这个区分让「卡片为什么没发出去」在日志里是可读的。
+    const roomy = rig({ narrationAllowance: 5 });
+    roomy.outbox.narrate(PEER, '进展 1');
+    roomy.outbox.narrate(PEER, '进展 2');
+    const overNarration = roomy.outbox.narrate(PEER, '再来一条进展');
+    expect(overNarration.ok).toBe(false);
+    expect(overNarration.reason).toContain('interaction reserve');
+  });
+
   it('still never lets a card spend the reply it is waiting on', async () => {
     // Cards outrank narration, but the reserve is the one thing they cannot take:
-    // the run they belong to still has to be able to say its conclusion.
+    // the run they belong to still has to be able to say its conclusion. With the
+    // per-class counters this is structural — notices are capped at
+    // `windowAllowance - 1`, so the reply's slot cannot be spent by a notice at all.
     const { outbox, sent } = rig();
-    for (let i = 0; i < WINDOW_ALLOWANCE; i++) outbox.narrate(PEER, `卡片 ${i}`, undefined, 'interaction');
-    expect(sent.map((entry) => entry.content)).toHaveLength(WINDOW_ALLOWANCE - 1);
-    expect(outbox.narrate(PEER, '再来一张', undefined, 'interaction').reason).toContain('interaction allowance spent');
+    for (let i = 0; i < INTERACTION_ALLOWANCE + 3; i++) {
+      outbox.narrate(PEER, `卡片 ${i}`, undefined, 'interaction');
+    }
+    expect(sent.map((entry) => entry.content)).toHaveLength(INTERACTION_ALLOWANCE);
 
     const reply = await outbox.reply(PEER, '结论');
     expect(reply.ok).toBe(true);

@@ -32,8 +32,15 @@
 
 /** Minimum gap between two narration messages. */
 export const PROGRESS_MIN_INTERVAL_MS = 4_000;
-/** Hard cap on narration messages per turn, the final answer excluded. */
-export const PROGRESS_MAX_UPDATES = 3;
+/**
+ * Hard cap on narration messages per turn, the final answer excluded.
+ *
+ * Kept at or below the outbox's narration allowance, because this relay is the
+ * only thing that narrates on its own schedule rather than on a real event: if
+ * it may spend more than the allowance, it fills the budget before a receipt or
+ * a card is even built. `NARRATION_ALLOWANCE` is 2, so this is 2.
+ */
+export const PROGRESS_MAX_UPDATES = 2;
 /** How many tool names one coalesced line may list before it abbreviates. */
 const TOOLS_PER_LINE = 6;
 /**

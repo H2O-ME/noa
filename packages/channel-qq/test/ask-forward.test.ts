@@ -1,13 +1,17 @@
 /**
  * 一条 ask 的生命周期：先推卡片，再等——**但只在卡片真的推出去之后才等**。
  *
- * 两个线上事故的形状都锁在这里，因为它们都是「操作者那边看起来一切正常」的失败：
+ * 三个线上事故的形状都锁在这里，因为它们都是「操作者那边看起来一切正常」的失败：
  *
  *  - 卡片被叙述额度挤掉：一轮碰了三个工具，三条「正在: …」正好花光叙述上限，审批卡
  *    被同一个上限拒掉，而调用方丢掉了返回值——聊天里什么都没出现，这一轮却停在三分钟
  *    的等待上，最后报「对端超时未答复」。对端从没被问到。
  *  - 推送失败后仍然空等：没有窗口时卡片发不出去，同样白停一整段超时。没人被问到的
  *    问题不该占着这一轮。
+ *  - **收敛理由被丢掉**：卡片没发出去，收敛却只报「取消了」，模型于是如实转述成
+ *    「你取消了」——对一个从没看到问题的对端说。理由必须进工具结果（见下面那条
+ *    提问用例），而且**不能**改走一条 narration 去解释：拒绝这张卡的原因（额度用尽、
+ *    没有窗口）同样会拒绝那条解释，发出去只是给自己留一条「我说过了」的假日志。
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentSession, AskUserQuestionItem } from '@noa/core';
@@ -33,17 +37,17 @@ function recordingNotifier(result: OutboxResult | undefined = { ok: true }) {
   return { notify, pushes };
 }
 
-/** 一个只记「收敛成什么」的会话。 */
+/** 一个只记「收敛成什么」的会话（含提问那条路的理由）。 */
 function recordingAgent() {
   const decisions: unknown[] = [];
-  const cancelled: string[] = [];
+  const cancelled: { id: string; reason: string | undefined }[] = [];
   const agent = {
     resolveApproval: (_id: string, resolution: unknown) => {
       decisions.push(resolution);
       return true;
     },
-    cancelQuestion: (id: string) => {
-      cancelled.push(id);
+    cancelQuestion: (id: string, reason?: string) => {
+      cancelled.push({ id, reason });
       return true;
     },
   } as unknown as AgentSession;
@@ -56,8 +60,9 @@ afterEach(() => {
 
 describe('an approval card', () => {
   it('is pushed as an interaction, so narration cannot spend the slot it needs', () => {
-    // 类别不是装饰：`narration` 会被叙述额度（3）拦，`interaction` 不会。少了这个
-    // 类别，三个工具的进度就足以让审批卡永远发不出去。
+    // 类别不是装饰：`narration` 会被叙述额度拦（现在是 2），`interaction` 走自己的
+    // 计数器、并且叙述被额外限制在互动预留之外。少了这个类别，三条进度就足以让审批卡
+    // 永远发不出去。
     const { notify, pushes } = recordingNotifier();
     const { agent } = recordingAgent();
 
@@ -98,10 +103,12 @@ describe('an approval card', () => {
     expect(JSON.stringify(decisions[0])).toContain('没能发到聊天里');
     expect(JSON.stringify(decisions[0])).not.toContain('对端超时未答复');
 
-    const note = pushes.at(-1)?.text ?? '';
-    expect(note).toContain('没能发到聊天里');
-    expect(note).toContain('no live passive-reply window');
-    // 而且没有留下一个会再响一次的定时器。
+    // 而且**不再**补一条 narration 去解释：拒绝这张卡的原因（额度用尽、没有窗口）
+    // 同样会拒绝那条解释，发出去只是留一条「我说过了」的假日志。解释走工具结果 +
+    // 模型的回复，回复有保底名额。
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]?.text).toContain('需要审批');
+    // 没有留下一个会再响一次的定时器。
     const settled = pushes.length;
     vi.advanceTimersByTime(REMOTE_APPROVAL_TIMEOUT_MS * 2);
     expect(pushes).toHaveLength(settled);
@@ -137,7 +144,10 @@ describe('an approval card', () => {
 });
 
 describe('a question card', () => {
-  it('is pushed as an interaction and cancelled outright when it never went out', () => {
+  it('carries the delivery failure into the tool result instead of claiming a cancellation', () => {
+    // 线上实测：额度被前面的审批卡用光，提问卡没发出去，而收敛只报「取消了」——
+    // 模型于是如实对用户说「你取消了」，可用户从没看到过任何问题。理由必须一路
+    // 传到工具结果，让模型说的是「我没能问出去」。
     vi.useFakeTimers();
     const { notify, pushes } = recordingNotifier({ ok: false, reason: 'interaction allowance spent for this message (4)' });
     const { agent, cancelled } = recordingAgent();
@@ -145,10 +155,9 @@ describe('a question card', () => {
     new PendingAsks(notify).forwardQuestion(agent, PEER, { id: 'q-1', questions: QUESTIONS });
 
     expect(pushes[0]?.kind).toBe('interaction');
-    expect(cancelled).toEqual(['q-1']);
-    const note = pushes.at(-1)?.text ?? '';
-    expect(note).toContain('没能发到聊天里');
-    expect(note).not.toContain('超时');
+    expect(cancelled).toEqual([{ id: 'q-1', reason: 'interaction allowance spent for this message (4)' }]);
+    // 只推了那张没成功的卡，没有第二条解释。
+    expect(pushes).toHaveLength(1);
     vi.advanceTimersByTime(REMOTE_QUESTION_TIMEOUT_MS * 2);
     expect(cancelled).toHaveLength(1);
   });
@@ -161,7 +170,9 @@ describe('a question card', () => {
     new PendingAsks(notify).forwardQuestion(agent, PEER, { id: 'q-1', questions: QUESTIONS });
     vi.advanceTimersByTime(REMOTE_QUESTION_TIMEOUT_MS);
 
-    expect(cancelled).toEqual(['q-1']);
+    // 超时是**对端**没答复：没有理由，内核据此报 `ASK_CANCELLED`，措辞与「卡片没发出去」
+    // 完全不同。两条路必须可分辨，否则模型分不清是谁的问题。
+    expect(cancelled).toEqual([{ id: 'q-1', reason: undefined }]);
     expect(pushes.at(-1)?.text).toContain('提问超时');
   });
 });

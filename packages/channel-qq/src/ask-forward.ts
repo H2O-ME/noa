@@ -45,10 +45,10 @@ interface PendingAskSpec {
    */
   settle: (why: 'timeout' | 'undelivered', reason?: string) => void;
   /**
-   * 收敛之后对读者说的那句话。`why` 区分「等够了」与「压根没问出去」——后者不是
-   * 对端的错，不该写成超时。
+   * 等够了之后对读者说的那句话。**只有超时这一种**：卡片压根没发出去时，解释走不了
+   * 这条路（见 `ask`），它改走工具结果 + 模型的回复。
    */
-  note: (why: 'timeout' | 'undelivered', reason?: string) => string;
+  timeoutNote: string;
 }
 
 /**
@@ -111,12 +111,9 @@ export class PendingAsks {
             : `审批卡没能发到聊天里（${reason ?? '未知原因'}），这一轮没有等到答复`,
         });
       },
-      note: (why, reason) => (why === 'timeout'
-        ? `审批超时（${seconds} 秒未回复），已按拒绝处理：${request.call.name}`
-        : `审批卡没能发到聊天里（${reason ?? '未知原因'}），这一轮没有等你答复，已按拒绝处理：${request.call.name}`),
+      timeoutNote: `审批超时（${seconds} 秒未回复），已按拒绝处理：${request.call.name}`,
     });
   }
-
   /**
    * Push one `ask_user_question` batch to QQ and arm its must-cancel timer.
    *
@@ -149,10 +146,16 @@ export class PendingAsks {
       text: body,
       rich,
       timeoutMs: REMOTE_QUESTION_TIMEOUT_MS,
-      settle: () => { agent.cancelQuestion(request.id); },
-      note: (why, reason) => (why === 'timeout'
-        ? `提问超时（${minutes} 分钟未回复），已取消。`
-        : `提问卡没能发到聊天里（${reason ?? '未知原因'}），已直接取消。`),
+      settle: (why, reason) => {
+        // The approval path above has always passed its reason through; this one
+        // dropped it, so a card that never reached the chat was reported to the
+        // model as `ASK_CANCELLED` — "the user cancelled" — and the model relayed
+        // exactly that to a peer who had never been shown a question. Observed
+        // live. A reason here makes it `ASK_UNDELIVERED` instead: nobody was
+        // asked, and that is what the model must say.
+        agent.cancelQuestion(request.id, why === 'timeout' ? undefined : (reason ?? '未知原因'));
+      },
+      timeoutNote: `提问超时（${minutes} 分钟未回复），已取消。`,
     });
   }
 
@@ -183,18 +186,25 @@ export class PendingAsks {
    * the timer exists to bound how long a peer may take to answer, and a peer who
    * was never asked has nothing to answer. Waiting anyway costs the run its whole
    * turn and then reports a timeout the peer cannot make sense of.
+   *
+   * **Nothing is sent to explain it.** Whatever refused the card — an exhausted
+   * interaction allowance, no live passive window — refuses a narration for the
+   * same reason, so the explanation would be dropped too; sending it anyway only
+   * produced a log line claiming the peer had been told. It rides the TOOL RESULT
+   * instead: `settle` hands the reason to the kernel, the model reads it, and the
+   * model's reply has a reserved slot to explain in. That path also reaches a
+   * reader who is holding a phone with no other way to find out.
    */
   private ask(id: string, spec: PendingAskSpec): void {
     const pushed = this.notify(spec.peer, spec.text, spec.rich, 'interaction');
     if (pushed !== undefined && !pushed.ok) {
-      this.notify(spec.peer, spec.note('undelivered', pushed.reason));
       spec.settle('undelivered', pushed.reason);
       return;
     }
     this.timers.set(id, setTimeout(() => {
       this.settled(id);
       spec.settle('timeout');
-      this.notify(spec.peer, spec.note('timeout'));
+      this.notify(spec.peer, spec.timeoutNote);
     }, spec.timeoutMs));
   }
 }

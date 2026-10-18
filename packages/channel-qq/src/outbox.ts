@@ -42,11 +42,26 @@ import { bareImageUrl, type RichSend } from './protocol.js';
 /** How many messages one inbound `msg_id` may draw in total. */
 export const WINDOW_ALLOWANCE = 5;
 /**
- * How many of those narration may spend. The rest is RESERVED for the reply:
- * `WINDOW_ALLOWANCE - NARRATION_ALLOWANCE` is the reply's guarantee, and it is
- * why the split exists rather than one shared counter.
+ * How many of those narration may spend.
+ *
+ * Kept at or below `WINDOW_ALLOWANCE - 1 - INTERACTION_ALLOWANCE` so narration
+ * can never be the reason a card is refused. The two caps are enforced against
+ * separate counters (see `WindowLedger`) — a shared counter with a per-kind
+ * threshold looks like a split but is not one, and that is exactly how this
+ * allowance used to eat the interactions' share.
  */
-export const NARRATION_ALLOWANCE = 3;
+export const NARRATION_ALLOWANCE = 2;
+/**
+ * How many of those an interaction (an approval card, a question card) may
+ * spend — and, because it is the same number, how many slots narration must
+ * leave free.
+ *
+ * Two is what one turn actually needs: an approval and the question that
+ * follows it. A turn that wants more than that is a turn doing too much at
+ * once, and the honest outcome is the second card being refused LOUDLY (see
+ * `ask-forward.ts`) rather than silently.
+ */
+export const INTERACTION_ALLOWANCE = 2;
 
 /**
  * What one outbound notice IS — and therefore who wins when the budget is short.
@@ -62,6 +77,15 @@ export const NARRATION_ALLOWANCE = 3;
  *    three-minute timer reporting "the peer did not answer" — a peer who was never
  *    asked. An interaction still spends from the WINDOW ledger, because the
  *    platform's own bound is the one that cannot be exceeded.
+ *
+ * That last paragraph described the fix but not the code: narration and
+ * interaction incremented ONE counter and merely compared it against different
+ * thresholds, so narration spending its cap still pushed the interaction's
+ * threshold out of reach. Observed live again, one release later: `interaction
+ * not sent … allowance spent for this message (4)` — a question card refused, and
+ * the peer told (by the model, faithfully relaying the kernel) that they had
+ * cancelled a question they were never shown. They are separate counters now, and
+ * narration is additionally capped so it cannot reach the interaction reserve.
  */
 export type NoticeKind = 'narration' | 'interaction';
 
@@ -86,13 +110,24 @@ export interface QqOutboxOptions {
   log?: (line: string) => void;
   windowAllowance?: number;
   narrationAllowance?: number;
+  interactionAllowance?: number;
 }
 
 /** One inbound message's spending so far. */
 interface WindowLedger {
-  used: number;
+  /** Droppable lines sent. Capped so they cannot reach the interaction reserve. */
+  narration: number;
+  /** Cards the turn is blocked on. Capped by `INTERACTION_ALLOWANCE`. */
+  interaction: number;
+  /** Answers sent. Counted apart so a reply never consumes a card's allowance. */
+  reply: number;
   /** The peer this window belongs to, so a mismatch is caught rather than sent. */
   peerId: string;
+}
+
+/** Everything this window has spent, which is what the platform's own bound counts. */
+function spent(ledger: WindowLedger): number {
+  return ledger.narration + ledger.interaction + ledger.reply;
 }
 
 export class QqOutbox {
@@ -102,6 +137,7 @@ export class QqOutbox {
   private readonly log: (line: string) => void;
   private readonly windowAllowance: number;
   private readonly narrationAllowance: number;
+  private readonly interactionAllowance: number;
   private readonly ledgers = new Map<string, WindowLedger>();
 
   constructor(options: QqOutboxOptions) {
@@ -111,6 +147,7 @@ export class QqOutbox {
     this.log = options.log ?? (() => undefined);
     this.windowAllowance = options.windowAllowance ?? WINDOW_ALLOWANCE;
     this.narrationAllowance = options.narrationAllowance ?? NARRATION_ALLOWANCE;
+    this.interactionAllowance = options.interactionAllowance ?? INTERACTION_ALLOWANCE;
   }
 
   /**
@@ -131,11 +168,10 @@ export class QqOutbox {
     const window = this.lastMsgIdOf(peerId);
     if (window === undefined) return { ok: false, reason: 'no live passive-reply window for this peer' };
     const ledger = this.ledgerFor(window, peerId);
-    const allowance = this.allowanceFor(kind);
-    if (ledger.used >= allowance) {
-      return { ok: false, reason: `${kind} allowance spent for this message (${allowance})` };
-    }
-    ledger.used += 1;
+    const refusal = this.refuseReason(ledger, kind);
+    if (refusal !== undefined) return { ok: false, reason: refusal };
+    if (kind === 'interaction') ledger.interaction += 1;
+    else ledger.narration += 1;
     // 即发即忘，而且**发出之后就不再碰它**：没有撤回，所以既不需要记住消息 id，也
     // 不需要世代来分辨「这条是答案之前还是之后落地的」。读者看过的消息就留在那里。
     void this.dispatch(peerId, content, window, rich).catch((err: unknown) => {
@@ -145,15 +181,38 @@ export class QqOutbox {
   }
 
   /**
-   * How much one class may spend in this window.
+   * Whether this notice may go out, or why not.
    *
-   * Both leave the reply its slot — that is the invariant, not the numbers. They
-   * differ in how much slack they take: narration is droppable and is kept to the
-   * lower cap, while an interaction may spend everything but the reply's slot,
-   * because refusing a card costs the run its whole turn.
+   * Three bounds, and the reason the two counters must stay separate:
+   *
+   *  - the class's own cap ({@link NARRATION_ALLOWANCE} / {@link
+   *    INTERACTION_ALLOWANCE}) — what a class may spend at most;
+   *  - the window's reserve for the reply, which nothing may touch;
+   *  - for narration only, the interaction reserve. This is the bound that was
+   *    missing: with one shared counter, narration spending its own cap still
+   *    consumed the headroom a later card needed, so a turn that narrated three
+   *    times refused its own question card.
+   * @param ledger - the window's spending so far.
+   * @param kind - which class this notice belongs to.
+   * @returns the refusal reason, or undefined when it may go out.
    */
-  private allowanceFor(kind: NoticeKind): number {
-    return kind === 'interaction' ? this.windowAllowance - 1 : this.narrationAllowance;
+  private refuseReason(ledger: WindowLedger, kind: NoticeKind): string | undefined {
+    const total = spent(ledger);
+    const notices = this.windowAllowance - 1;
+    if (kind === 'interaction') {
+      if (ledger.interaction >= this.interactionAllowance) {
+        return `interaction allowance spent for this message (${this.interactionAllowance})`;
+      }
+      if (total >= notices) return `reply reserve reached for this message (${this.windowAllowance})`;
+      return undefined;
+    }
+    if (ledger.narration >= this.narrationAllowance) {
+      return `narration allowance spent for this message (${this.narrationAllowance})`;
+    }
+    if (total >= notices - this.interactionAllowance) {
+      return `narration would spend the interaction reserve for this message (${this.interactionAllowance} kept)`;
+    }
+    return undefined;
   }
 
   /**
@@ -171,14 +230,14 @@ export class QqOutbox {
     const window = this.lastMsgIdOf(peerId);
     if (window === undefined) return { ok: false, reason: 'no live passive-reply window for this peer' };
     const ledger = this.ledgerFor(window, peerId);
-    if (ledger.used >= this.windowAllowance) {
+    if (spent(ledger) >= this.windowAllowance) {
       // The reserve is gone too: the platform's own bound is what is left, and
       // sending into it fails at the platform rather than here. Refusing is the
       // honest report; the text is already durable in the session log, so nothing
       // is lost that `/history` cannot reach.
       return { ok: false, reason: `reply allowance spent for this message (${this.windowAllowance})` };
     }
-    ledger.used += 1;
+    ledger.reply += 1;
     try {
       await this.dispatch(peerId, content, window, rich);
       return { ok: true };
@@ -219,7 +278,7 @@ export class QqOutbox {
   private ledgerFor(window: string, peerId: string): WindowLedger {
     const existing = this.ledgers.get(window);
     if (existing !== undefined && existing.peerId === peerId) return existing;
-    const created: WindowLedger = { used: 0, peerId };
+    const created: WindowLedger = { narration: 0, interaction: 0, reply: 0, peerId };
     this.ledgers.set(window, created);
     // Bounded: a window only matters while it is the live one, and old keys are
     // unreachable. Pruning on insert keeps a long-running channel from growing one
