@@ -90,9 +90,13 @@ export class HumanAskSeam {
     return this.questions.resolve(id, answer);
   }
 
-  /** The human dismissed a batch; false for unknown/consumed ids. */
-  cancelQuestion(id: string): boolean {
-    return this.questions.cancel(id);
+  /**
+   * End a batch without an answer; false for unknown/consumed ids.
+   *
+   * A `reason` means the card never reached anyone — see `QuestionBroker.cancel`.
+   */
+  cancelQuestion(id: string, reason?: string): boolean {
+    return this.questions.cancel(id, reason);
   }
 
   /** Fail-closed sweep of the question waits (the session's abort/close paths). */

@@ -257,9 +257,13 @@ export interface ToolDefinition {
 }
 
 /**
- * Approval kinds a tool call can require. `read-external` is a read that
- * reaches outside the workspace root: auto-allowed only in `full` mode,
- * otherwise it goes through the interactive approval gate.
+ * Approval kinds a tool call can require.
+ *
+ * The two `*-external` kinds are what reaches outside the workspace root:
+ * `read-external` for a read, `write-external` for a write. Both are
+ * auto-allowed only in `full` mode; otherwise they go through the interactive
+ * approval gate. Keeping them separate from the plain `read` / `write` kinds is
+ * what makes those safe to auto-allow — see `PermissionService.autoAllows`.
  *
  * `network` is a **read** that leaves the machine (a URL fetch), so it is
  * auto-allowed in `auto` like any other read — see
@@ -267,7 +271,7 @@ export interface ToolDefinition {
  * data (upload, post, mutate remote state) must not declare this kind; that
  * belongs behind `execute`.
  */
-export type ToolPermissionKind = 'read' | 'read-external' | 'write' | 'execute' | 'network';
+export type ToolPermissionKind = 'read' | 'read-external' | 'write' | 'write-external' | 'execute' | 'network';
 
 /** Events emitted by a ChatProvider during a single completion stream. */
 export type StreamEvent =

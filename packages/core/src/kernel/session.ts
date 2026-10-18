@@ -567,9 +567,16 @@ export class AgentSession {
     return this.askSeam.resolveQuestion(id, answer);
   }
 
-  /** The human dismissed a question batch; false for unknown/consumed ids. */
-  cancelQuestion(id: string): boolean {
-    return this.askSeam.cancelQuestion(id);
+  /**
+   * End a question batch without an answer; false for unknown/consumed ids.
+   *
+   * `reason` distinguishes the two ways this happens. Absent (or empty) is the
+   * human dismissing the card — `ASK_CANCELLED`. Present means the surface could
+   * not deliver the card, so nobody was asked — `ASK_UNDELIVERED`, which the model
+   * must relay as "I could not ask you" rather than "you cancelled".
+   */
+  cancelQuestion(id: string, reason?: string): boolean {
+    return this.askSeam.cancelQuestion(id, reason);
   }
 
   /**

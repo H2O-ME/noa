@@ -240,6 +240,41 @@ describe('QuestionBroker', () => {
   });
 });
 
+describe('a question nobody was asked', () => {
+  // 线上实测（2026-10-18）：互动额度用尽，提问卡根本没发出去，而收敛只报「取消了」——
+  // 模型于是如实转述成「你取消了」，对一个从没看到过问题的对端说。这两条把「没人被
+  // 问到」与「对端取消了」在类型和措辞上分开。
+  it('reports a card that never arrived as undelivered, not as a dismissal', async () => {
+    const { broker, requests, resolutions } = wired();
+    const pending = broker.asker(QUESTIONS);
+    const id = requests[0] as string;
+
+    expect(broker.cancel(id, 'interaction allowance spent for this message (4)')).toBe(true);
+
+    await expect(pending).rejects.toMatchObject({
+      code: 'ASK_UNDELIVERED',
+      message: expect.stringContaining('nobody was asked') as unknown as string,
+    });
+    await expect(pending).rejects.toMatchObject({
+      message: expect.stringContaining('do not retry it') as unknown as string,
+    });
+    await expect(pending).rejects.toMatchObject({
+      message: expect.stringContaining('interaction allowance spent') as unknown as string,
+    });
+    expect(resolutions).toEqual([
+      { source: 'undelivered', reason: 'interaction allowance spent for this message (4)' },
+    ]);
+  });
+
+  it('treats an empty reason as no reason, so a dismissal stays a dismissal', async () => {
+    const { broker, requests } = wired();
+    const pending = broker.asker(QUESTIONS);
+    const id = requests[0] as string;
+    expect(broker.cancel(id, '')).toBe(true);
+    await expect(pending).rejects.toMatchObject({ code: 'ASK_CANCELLED' });
+  });
+});
+
 describe('deriveUserQuestions — "does this surface have a person"', () => {
   // The one derivation every assembly host copies (`runtime-env` service
   // provider, cli `buildSurfaceRuntime`). Fail-closed by default, and the

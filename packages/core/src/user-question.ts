@@ -71,6 +71,13 @@ export type QuestionResolution =
   | { source: 'user'; answer: AskUserQuestionAnswer }
   /** The human dismissed the whole batch (the surface's cancel control). */
   | { source: 'cancelled' }
+  /**
+   * The surface could not put the question in front of anyone, so nobody was
+   * asked. Distinct from `cancelled` on purpose: the tool result is what the
+   * model relays to the peer, and "the user cancelled" is a false account of a
+   * card that never arrived — observed live, the model repeated it verbatim.
+   */
+  | { source: 'undelivered'; reason: string }
   /** The run was interrupted while the question was outstanding. */
   | { source: 'aborted' }
   /** The session closed with the question outstanding (terminal). */
@@ -104,7 +111,12 @@ export const MAX_OPTION_DESCRIPTION_CHARS = 1000;
 export const MAX_CUSTOM_ANSWER_CHARS = 4000;
 
 /** Stable error codes for the ask path (the tool renders the message verbatim). */
-export type UserQuestionErrorCode = 'EMPTY_QUESTIONS' | 'NO_PROVIDER' | 'ASK_ABORTED' | 'ASK_CANCELLED';
+export type UserQuestionErrorCode =
+  | 'EMPTY_QUESTIONS'
+  | 'NO_PROVIDER'
+  | 'ASK_ABORTED'
+  | 'ASK_CANCELLED'
+  | 'ASK_UNDELIVERED';
 
 /**
  * The model-facing failure text, one string per code. Exported so the tool, the
@@ -116,12 +128,27 @@ export const USER_QUESTION_ERRORS: Record<UserQuestionErrorCode, string> = {
   NO_PROVIDER: 'no user-questions answerer accepted the request',
   ASK_ABORTED: 'ask_user_question was aborted before the user answered',
   ASK_CANCELLED: 'the user cancelled ask_user_question',
+  // The one failure that is NOT the peer's doing, so it must not read like a
+  // refusal. The reason is appended by the caller (it comes from the surface),
+  // and the sentence ends by telling the model what to do INSTEAD of retrying: a
+  // retry spends another card from an allowance that just ran out, so it fails
+  // the same way and costs the peer a second silent round.
+  ASK_UNDELIVERED:
+    'ask_user_question never reached the user, so nobody was asked — do not retry it; say so in your reply instead',
 };
 
 /** A typed ask failure: the code is what callers branch on, the message is for the model. */
 export class UserQuestionError extends Error {
-  constructor(readonly code: UserQuestionErrorCode) {
-    super(USER_QUESTION_ERRORS[code]);
+  constructor(
+    readonly code: UserQuestionErrorCode,
+    /** Surface-supplied detail for `ASK_UNDELIVERED`; ignored by the other codes. */
+    readonly detail?: string,
+  ) {
+    super(
+      detail === undefined || detail.length === 0
+        ? USER_QUESTION_ERRORS[code]
+        : `${USER_QUESTION_ERRORS[code]} (${detail})`,
+    );
     this.name = 'UserQuestionError';
   }
 }
@@ -312,8 +339,18 @@ export class QuestionBroker {
     return true;
   }
 
-  /** The human dismissed the whole batch; the ask fails with `ASK_CANCELLED`. */
-  cancel(id: string): boolean {
+  /**
+   * The human dismissed the whole batch; the ask fails with `ASK_CANCELLED`.
+   *
+   * `reason` is for the case where there was no dismissal to speak of — the
+   * surface could not deliver the card at all. It switches the failure to
+   * `ASK_UNDELIVERED` so the model relays "nobody was asked" instead of telling
+   * the peer they cancelled a question they never saw.
+   */
+  cancel(id: string, reason?: string): boolean {
+    if (reason !== undefined && reason.length > 0) {
+      return this.failOne(id, new UserQuestionError('ASK_UNDELIVERED', reason), { source: 'undelivered', reason });
+    }
     return this.failOne(id, new UserQuestionError('ASK_CANCELLED'), { source: 'cancelled' });
   }
 
