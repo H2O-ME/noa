@@ -22,7 +22,7 @@ export function bannerLines(info: {
     `  配置文件  ${info.configPath}`,
     `  工作区    ${info.workspace}`,
     `  模型      ${info.model === '' ? '(未命名)' : info.model}`,
-    `  审批档位  ${info.approval}（对端可用 /perm 调低，不能调高）`,
+    `  审批档位  ${info.approval}（auto=智能审批，full=全放行；对端可用 /perm 切换）`,
   ];
 }
 
@@ -30,17 +30,13 @@ export function bannerLines(info: {
 export const CHANNEL_LIVE =
   'QQ 通道已启动：每个 QQ 对话各自绑定一段持久会话，回复走平台的被动回复窗口。Ctrl+C 退出。';
 
-/** Nobody is enrolled yet — the enrollment secret is the only way in. */
-export function enrollmentHint(code: string | undefined): string {
-  return code === undefined
-    ? '还没有绑定任何 QQ 号，且没有配置配对码：请在通道行的 config 里设置 pairingCode 后重启。'
-    : `还没有绑定任何 QQ 号。用手机 QQ 私聊本机器人发送：/pair ${code}`;
-}
-
-/** At least one peer is bound; the count is the operator's own reading. */
-export function enrolledLine(count: number): string {
-  return `已绑定 ${count} 个 QQ 号；要新增设备，换一个新配对码（通道行 config 的 pairingCode）后重启。`;
-}
+/**
+ * The deprecated-key notes were more than a report: the file has been rewritten.
+ *
+ * Said out loud because a start-up that edits the operator's own config without
+ * mentioning it is the kind of surprise that makes someone distrust the file.
+ */
+export const CONFIG_HEALED = '提示：上面的废弃键已按当前形状重写回配置文件，之后启动不再提示。';
 
 /**
  * Three causes, three next actions — merging them into one hint is the bug.

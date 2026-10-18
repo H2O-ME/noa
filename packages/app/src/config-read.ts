@@ -10,6 +10,7 @@
  * lives inside `config` is the owning plugin's business.
  */
 import { docFile, plainMember, readDoc } from './config-doc.js';
+import { migrateConfigDocument } from './config-migrate.js';
 
 /** One plugin row as stored on disk. */
 export interface StoredPluginEntry {
@@ -30,6 +31,9 @@ export interface StoredPluginEntry {
  */
 export async function readPluginEntries(homedir?: string): Promise<StoredPluginEntry[]> {
   const doc = await readDoc(docFile(homedir)).catch(() => undefined);
+  // Deprecated row keys must be gone before the tree validates each row against
+  // its plugin's strict schema — this read is what a re-roster rebuilds from.
+  if (doc !== undefined) migrateConfigDocument(doc);
   const entries = plainMember(doc, 'plugins')?.['entries'];
   if (!Array.isArray(entries)) return [];
   const rows: StoredPluginEntry[] = [];

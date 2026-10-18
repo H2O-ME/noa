@@ -15,6 +15,16 @@ import { appHome, userConfigPath } from '@noa/core';
 /** The channel's row id: a module specifier, resolved against this app. */
 export const CHANNEL_ROW_ID = '@noa/channel-qq';
 
+/**
+ * The memory system's row id, likewise a module specifier.
+ *
+ * A literal rather than an import from `@noa/plugin-memory` on purpose: the app
+ * must not depend on a package that is OPTIONAL (`@noa/plugins` lists it as an
+ * optionalDependency), or a build that ships without it would not compile. The
+ * specifier is the contract — the same string the plugin's package.json carries.
+ */
+export const MEMORY_ROW_ID = '@noa/plugin-memory';
+
 /** The placeholder `noa init` writes for values only the operator can fill. */
 export const PLACEHOLDER = 'REPLACE_ME';
 
@@ -32,7 +42,7 @@ export function starterConfig(workspace: string): Record<string, unknown> {
       apiKey: PLACEHOLDER,
       model: 'your-model-id',
     },
-    approval: 'read-only',
+    approval: 'auto',
     workspace,
     plugins: {
       entries: [
@@ -42,9 +52,14 @@ export function starterConfig(workspace: string): Record<string, unknown> {
           config: {
             appId: '',
             clientSecret: '',
-            maxTier: 'read-only',
           },
         },
+        // On by default, unlike the other shipped extension packages: continuity
+        // is the point of a resident agent, and a memory system an operator has to
+        // find and switch on is one that never accumulates anything. It degrades
+        // to keyword matching with no `embedModel` configured, so enabling it on a
+        // fresh install costs nothing.
+        { id: MEMORY_ROW_ID, enabled: true },
       ],
     },
   };

@@ -17,6 +17,7 @@ import os from 'node:os';
 import { z } from 'zod';
 import { errMessage, userConfigPath } from '@noa/core';
 import { expandConfigDocument, type ConfigDiagnostic } from './config-expand.js';
+import { migrateConfigDocument } from './config-migrate.js';
 
 export { expandRefs, diagnosticText, unresolvedRef } from './config-expand.js';
 export type { ConfigDiagnostic } from './config-expand.js';
@@ -36,15 +37,63 @@ const configSchema_ = z
         apiKey: z.string().min(1),
         /** Model id as the endpoint spells it. */
         model: z.string().min(1).optional(),
+        /**
+         * What the model above accepts, when models.dev cannot say.
+         *
+         * `["text"]` means images are NOT sent to it: they are replaced by a line
+         * naming the file on disk, because a gateway that does not accept image
+         * parts may answer 200 and drop them, leaving the model to explain a
+         * question about a picture it never received. `["text","image"]` sends
+         * them. Absent means "ask models.dev".
+         *
+         * It exists because automatic metadata runs out on gateway aliases: the
+         * id `DeepSeek-V4-Flash` appears under ~40 models.dev providers and they
+         * disagree, and `GLM-4V-Flash` does not appear at all. Measured on this
+         * product's own gateway, `DeepSeek-V4-Flash` answers 200 to a request
+         * carrying a 195KB image and reports the same `prompt_tokens` as one
+         * carrying none — the picture is dropped in silence. No amount of
+         * metadata can detect that; the operator can.
+         */
+        inputModalities: z.array(z.string().min(1)).min(1).optional(),
         /** Sampling temperature, passed through to the provider. */
         temperature: z.number().min(0).max(2).optional(),
         /** Passed through as `max_tokens` when set. */
         maxTokens: z.number().int().positive().max(1_000_000).optional(),
+        /**
+         * Extra endpoints to fall back to, in order, when the primary cannot
+         * serve a request: a terminal rejection (401/403/404 — re-asking the
+         * same host cannot help) or a spent retry budget (rate limit, quota, a
+         * host that is down). The fallback is tried INSIDE the same request, so
+         * a turn survives the primary going away instead of failing on the first
+         * message of the outage.
+         *
+         * Same protocol, different address: this is for a second key or a second
+         * mirror of the same model, not for a provider of another shape.
+         * `model` is optional because the usual case is the same id served
+         * elsewhere; name it when the two endpoints spell it differently.
+         *
+         * After the primary fails, the next ~60s of requests try the fallbacks
+         * FIRST and only then the primary — so a rate-limited endpoint is not
+         * re-hit on every turn. That window is a preference, not a verdict: it
+         * lapses on its own and a working primary takes the lead back.
+         */
+        fallbacks: z
+          .array(
+            z
+              .object({
+                baseURL: z.string().min(1),
+                apiKey: z.string().min(1),
+                model: z.string().min(1).optional(),
+              })
+              .strict(),
+          )
+          .min(1)
+          .optional(),
       })
       .strict()
       .optional(),
-    /** Permission tier new conversations start at. Defaults to `read-only`. */
-    approval: z.enum(['read-only', 'auto-edit', 'full']).optional(),
+    /** Permission tier new conversations start at. Defaults to `auto`. */
+    approval: z.enum(['full', 'auto']).optional(),
     /**
      * Appended to every session's directives (not the persona). Use it for
      * deployment-wide instructions — "answer in Chinese", a house style.
@@ -64,6 +113,67 @@ const configSchema_ = z
      * means no titles; a failure to title never touches the run.
      */
     titleModel: z.string().min(1).optional(),
+    /**
+     * The model that reviews a gated tool call in the `auto` tier (the
+     * smart-approval classifier). It runs on the SAME endpoint as `provider`
+     * (baseURL/apiKey are reused); unset means the reviewer uses the main model.
+     * A cheap, fast model is the right choice here — it classifies one command,
+     * it does not do the work.
+     */
+    reviewModel: z.string().min(1).optional(),
+    /**
+     * The model that turns text into vectors, for the memory system's semantic
+     * recall. Same endpoint as `provider` (baseURL/apiKey are reused).
+     *
+     * Unset means NO embeddings, and that is a supported state rather than a
+     * half-configured one: `recall` falls back to keyword matching and everything
+     * else about memory works unchanged. There is deliberately no fallback to
+     * `provider.model` — a chat model id sent to `/embeddings` is a 404, so
+     * guessing would trade "no semantic search" for "every recall fails".
+     */
+    embedModel: z.string().min(1).optional(),
+    /**
+     * The model that turns voice messages into text, for the QQ channel's inbound
+     * voice. Same endpoint as `provider` (baseURL/apiKey are reused).
+     *
+     * Unset means NO transcription, and that is a supported state rather than a
+     * half-configured one: a voice message then arrives as
+     * 「收到一条语音，未配置转写」and the rest of the message is unaffected. There is
+     * deliberately no fallback to `provider.model` — a chat model id sent to
+     * `/audio/transcriptions` is a 404, so guessing would trade "no transcripts"
+     * for "every voice message fails".
+     */
+    sttModel: z.string().min(1).optional(),
+    /**
+     * What each model costs, in USD per MILLION tokens — the unit every endpoint
+     * publishes prices in. Keyed by model id exactly as the endpoint spells it
+     * (the same spelling `provider.model` carries after boot reconciliation).
+     *
+     * This is a DISPLAY fact, not a routing one: nothing here changes what is
+     * sent or where. Its only reader is `/usage`, which turns the session's token
+     * totals into an estimate.
+     *
+     * Unset is a supported state: `/usage` then reports tokens and says the model
+     * is unpriced, rather than printing $0.00 — a number that is indistinguishable
+     * from "free". A model missing from the table reads the same way, and so does a
+     * table entry with neither side filled in.
+     *
+     * A price on ONE side only is honored as such: the estimate is then reported
+     * as a LOWER BOUND rather than pretending the unpriced side is free.
+     */
+    pricing: z
+      .record(
+        z.string().min(1),
+        z
+          .object({
+            /** Prompt-token price, USD per million. */
+            input: z.number().nonnegative().optional(),
+            /** Completion-token price, USD per million. */
+            output: z.number().nonnegative().optional(),
+          })
+          .strict(),
+      )
+      .optional(),
     /**
      * The directory the agent works in — its workspace. Defaults to the process's
      * current directory. This is where `read_file` / `write_file` are rooted and
@@ -142,6 +252,12 @@ export type Config = z.infer<typeof configSchema>;
 export interface LoadedConfig {
   readonly config: Config;
   readonly diagnostics: readonly ConfigDiagnostic[];
+  /**
+   * Non-fatal upgrades applied to the document while loading (deprecated keys
+   * rewritten to their current shape). Printed once at boot so the operator
+   * knows why their file looks different the next time a save rewrites it.
+   */
+  readonly warnings: readonly string[];
 }
 
 /**
@@ -163,7 +279,7 @@ export async function loadConfigWithDiagnostics(homedir: string = os.homedir()):
     raw = await readFile(file, 'utf8');
   } catch (err) {
     if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { config: configSchema.parse({}), diagnostics: [] };
+      return { config: configSchema.parse({}), diagnostics: [], warnings: [] };
     }
     throw err;
   }
@@ -173,6 +289,9 @@ export async function loadConfigWithDiagnostics(homedir: string = os.homedir()):
   } catch (err) {
     throw new Error(`invalid JSON in ${file}: ${errMessage(err)}`);
   }
+  // Upgrade deprecated keys BEFORE expanding/validating: the schema is strict and
+  // would otherwise refuse a file written by an earlier release.
+  const warnings = migrateConfigDocument(parsed);
   const { value: expanded, diagnostics } = expandConfigDocument(parsed);
   const result = configSchema.safeParse(expanded);
   if (!result.success) {
@@ -181,7 +300,7 @@ export async function loadConfigWithDiagnostics(homedir: string = os.homedir()):
       .join('\n');
     throw new Error(`invalid config ${file}:\n${issues}`);
   }
-  return { config: result.data, diagnostics };
+  return { config: result.data, diagnostics, warnings };
 }
 
 /**

@@ -18,6 +18,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { userConfigPath } from '@noa/core';
 import { configSchema } from './config.js';
+import { migrateConfigDocument } from './config-migrate.js';
 
 /** Rewrite one config file atomically (same-dir tmp + rename). */
 async function writeDoc(file: string, doc: unknown): Promise<void> {
@@ -124,6 +125,10 @@ async function applyPatch(file: string, patch: (doc: Record<string, unknown>) =>
   if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) {
     throw new Error(`${file}: config root must be a JSON object`);
   }
+  // Heal deprecated keys on the way through: the patched result is what gets
+  // validated and written, so the first save after an upgrade rewrites the file
+  // into the current shape instead of refusing it (the schema is strict).
+  migrateConfigDocument(doc);
   patch(doc as Record<string, unknown>);
   // Validate the PATCHED RAW document before the commit: the atomic write
   // protects the file's integrity, not its validity. The raw form is what is
@@ -141,6 +146,44 @@ async function applyPatch(file: string, patch: (doc: Record<string, unknown>) =>
 }
 
 function noop(): void {}
+
+/**
+ * Heal a legacy config file in place, WITHOUT a patch to hang it on.
+ *
+ * `patchConfig` heals deprecated keys as a side effect of the write it was asked
+ * for. That is enough only while something still writes the file: the pairing
+ * flow and the settings page were both removed, so during a normal boot nothing
+ * patches it any more — which made a legacy document announce its deprecated keys
+ * on every single start, forever, while the module header promised the first save
+ * would fix it.
+ *
+ * Two rules this keeps from `applyPatch`: it writes ONLY when the migration
+ * actually changed something (a boot must not rewrite a current file, and must
+ * never invent one that is absent), and it validates before committing.
+ * @param homedir - Override for tests; defaults to the real home.
+ * @returns the notes for what it rewrote ([] when there was nothing to do).
+ */
+export async function healConfigFile(homedir?: string): Promise<readonly string[]> {
+  const file = docFile(homedir);
+  const doc: unknown = await readDoc(file).catch((err: unknown) => {
+    // No file yet: there is nothing to heal, and creating one here would make a
+    // read of the config a write.
+    if (err instanceof Error && err.message.startsWith('missing config')) return undefined;
+    throw err;
+  });
+  if (doc === undefined) return [];
+  const notes = migrateConfigDocument(doc);
+  if (notes.length === 0) return [];
+  const checked = configSchema.safeParse(doc);
+  if (!checked.success) {
+    const issues = checked.error.issues
+      .map((issue) => `  ${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .join('\n');
+    throw new Error(`refusing to rewrite ${file} — the result would not load:\n${issues}`);
+  }
+  await writeDoc(file, doc);
+  return notes;
+}
 
 /** Sorted, de-duplicated string list (a disable list's canonical form). */
 export function sortedUnique(names: readonly string[]): string[] {

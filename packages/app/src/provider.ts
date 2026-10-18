@@ -6,8 +6,9 @@
  * `provider-model-resolve.ts`, with the multi-endpoint store left behind: this
  * product has ONE endpoint, and the provider block is where it lives.
  */
-import { OpenAICompatClient } from '@noa/ai';
-import { resolveModelId } from '@noa/core';
+import { createEmbedClient, createTranscribeClient, OpenAICompatClient } from '@noa/ai';
+import { resolveModelId, type EmbeddingClient, type TranscriptionClient } from '@noa/core';
+import { REVIEW_MAX_TOKENS } from '@noa/plugins';
 import { PLACEHOLDER } from './channel-row.js';
 import type { Config } from './config.js';
 
@@ -49,6 +50,7 @@ export async function createProvider(config: Config): Promise<OpenAICompatClient
     baseURL: endpoint.baseURL,
     apiKey: endpoint.apiKey,
     model: endpoint.model ?? '',
+    ...(endpoint.fallbacks !== undefined ? { fallbacks: endpoint.fallbacks } : {}),
     ...(endpoint.temperature !== undefined ? { temperature: endpoint.temperature } : {}),
     ...(endpoint.maxTokens !== undefined ? { maxTokens: endpoint.maxTokens } : {}),
   });
@@ -81,6 +83,75 @@ export function createTitleProvider(config: Config): OpenAICompatClient | undefi
     // A title is a label; the endpoint default is a runaway budget for one line.
     maxTokens: 200,
   });
+}
+
+/**
+ * The smart-approval reviewer's client: another model on the SAME endpoint.
+ *
+ * Reuses `provider.baseURL` / `apiKey` and takes the model from `reviewModel`,
+ * falling back to the main model when it is unset — so an operator who configures
+ * nothing still gets a working (if unisolated) reviewer, and one who names a
+ * cheap model gets a genuinely separate classifier. `temperature: 0` and a tiny
+ * token budget because the answer is one word; no id reconciliation, because a
+ * reviewer that names an unknown model fails closed (escalates to the human).
+ * @param config - the loaded config.
+ * @returns undefined when no endpoint is configured.
+ */
+export function createReviewProvider(config: Config): OpenAICompatClient | undefined {
+  const endpoint = config.provider;
+  if (endpoint === undefined) return undefined;
+  return new OpenAICompatClient({
+    baseURL: endpoint.baseURL,
+    apiKey: endpoint.apiKey,
+    model: config.reviewModel ?? endpoint.model ?? '',
+    temperature: 0,
+    maxTokens: REVIEW_MAX_TOKENS,
+  });
+}
+
+/**
+ * The embedding client: a DIFFERENT kind of model on the SAME endpoint.
+ *
+ * Unlike the reviewer there is NO fallback to the main model. An embedding
+ * request carries `input` and returns vectors, and a chat model id sent to
+ * `/embeddings` is a 404 — so "no `embedModel` configured" must mean NO
+ * EMBEDDING CLIENT, which the memory plugin reads as "degrade to keyword
+ * scoring". Falling back would turn an unconfigured install into an install
+ * that fails every recall with an endpoint error.
+ *
+ * No id reconciliation either: a `GET /models` on every boot to correct a name
+ * we may not even use is a cost with no matching benefit, and the plugin
+ * degrades on the first failure anyway.
+ * @param config - the loaded config.
+ * @returns undefined when there is no endpoint or no `embedModel`.
+ */
+export function createEmbedProvider(config: Config): EmbeddingClient | undefined {
+  const endpoint = config.provider;
+  if (endpoint === undefined) return undefined;
+  const model = config.embedModel;
+  // The starter file's placeholder is an unconfigured value, exactly as it is for
+  // the main model: constructing a client for it would spend a round trip to be
+  // told "401" by a host that is not the operator's.
+  if (model === undefined || model === PLACEHOLDER) return undefined;
+  return createEmbedClient({ baseURL: endpoint.baseURL, apiKey: endpoint.apiKey, model });
+}
+
+/**
+ * The transcription client: the same "no fallback" rule as the embedding client.
+ *
+ * `sttModel` is a DIFFERENT model id from `provider.model`, and a chat model id
+ * sent to `/audio/transcriptions` is a 404 — so "no `sttModel` configured" must
+ * mean NO TRANSCRIPTION CLIENT, which the QQ channel reads as "answer
+ * 「未配置转写」and keep the rest of the message".
+ * @param config - the loaded config.
+ * @returns undefined when there is no endpoint or no `sttModel`.
+ */
+export function createTranscribeProvider(config: Config): TranscriptionClient | undefined {
+  const endpoint = config.provider;
+  if (endpoint === undefined) return undefined;
+  const model = config.sttModel;
+  if (model === undefined || model === PLACEHOLDER) return undefined;
+  return createTranscribeClient({ baseURL: endpoint.baseURL, apiKey: endpoint.apiKey, model });
 }
 
 /**

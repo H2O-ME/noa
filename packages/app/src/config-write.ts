@@ -19,6 +19,7 @@
  * references. Writing such a string wants `clientSecret` to mean "read this
  * variable", not to embed a literal.
  */
+import type { ModelDefaultsPort } from '@noa/core';
 import { docFile, ensureList, patchConfig, plainMember, readDoc, sortedUnique } from './config-doc.js';
 
 /** One plugin row as the durable document stores it. */
@@ -143,6 +144,58 @@ export async function setSkillEnabled(name: string, enabled: boolean, homedir?: 
     result = next;
   }, homedir);
   return result;
+}
+
+/**
+ * Persist one model id as this deployment's default (`provider.model`).
+ *
+ * 逐键写：只碰 `provider.model`，其余字节原样保留 —— 包括 `{env:NAME}` 引用和其它
+ * provider 字段。Hermes 用 round-trip YAML 保住注释与兄弟键（`utils.py:461`
+ * `atomic_roundtrip_yaml_update`，且明确拒绝整块重写 `model:`）；这里的目标一样，手段
+ * 是 raw JSON 文档改写（`config-doc.ts` 的三条保证：读原文、原子替换、解析不了就中止）。
+ *
+ * 配置里没有 `provider` 段时**抛错而不是新建**：那是配置本身不完整，凭空造一个段只会
+ * 把「没有端点」写成一个看起来正常的默认模型。
+ * @param model - the id to record.
+ * @param homedir - Override for tests; defaults to the real home.
+ */
+export async function setDefaultModel(model: string, homedir?: string): Promise<void> {
+  await patchConfig((doc) => {
+    const provider = plainMember(doc, 'provider');
+    if (provider === undefined) throw new Error('配置里没有 provider 段，写不了默认模型');
+    provider['model'] = model;
+  }, homedir);
+}
+
+/** The model the config FILE names, without expanding `{env:…}` references. */
+export async function readDefaultModel(homedir?: string): Promise<string | undefined> {
+  const doc = await readDoc(docFile(homedir)).catch(() => undefined);
+  const model = plainMember(doc, 'provider')?.['model'];
+  return typeof model === 'string' && model.length > 0 ? model : undefined;
+}
+
+/**
+ * The kernel's model-defaults seat, over this deployment's config file.
+ *
+ * `setDefault` deliberately lets a failure through as `{ok: false, reason}` rather
+ * than throwing: the caller is a chat command that must answer with a sentence,
+ * and the interesting failures (unparseable config, no `provider` section) are
+ * exactly the ones the operator needs named.
+ * @param homedir - Override for tests; defaults to the real home.
+ * @returns the port.
+ */
+export function modelDefaultsPort(homedir?: string): ModelDefaultsPort {
+  return {
+    configured: () => readDefaultModel(homedir),
+    setDefault: async (model) => {
+      try {
+        await setDefaultModel(model, homedir);
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+      }
+    },
+  };
 }
 
 /**
