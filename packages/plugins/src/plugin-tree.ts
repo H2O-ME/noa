@@ -67,8 +67,8 @@ import type { CreateKernelOptions, PluginOrigin } from './runtime-types.js';
  */
 export const SHIPPED_PACKAGES: readonly string[] = [
   '@noa/plugin-subagent',
-  '@noa/plugin-context',
   '@noa/plugin-ptc',
+  '@noa/plugin-memory',
 ];
 
 /**

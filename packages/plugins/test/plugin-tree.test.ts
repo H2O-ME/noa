@@ -1,6 +1,5 @@
 /**
- * Contract group 2 — PLUGIN DISCOVERY (`buildTree`), and group 5 — the boot
- * graph's `page` flag.
+ * Contract group 2 — PLUGIN DISCOVERY (`buildTree`).
  *
  * Discovery is the step that decides which rows EXIST, and two of its rules are
  * promises the rest of the product leans on:
@@ -13,11 +12,6 @@
  *    becomes a visible row carrying `error`, so a typo'd `plugins.entries` line
  *    still boots the kernel and still says what is wrong. The same test pins the
  *    mirror side — nothing is thrown out of assembly.
- *
- * Group 5 is one line of projection with a long reach: `page: true` on the roster
- * is what draws a settings section, so it must come from the plugin's OWN
- * manifest and from nowhere else — a host-invented page would put a section in
- * the navigation that nobody answers.
  *
  * The last group turns to the roster PROJECTION itself (`describePlugins`) and to
  * the manifest a third-party JS plugin really writes: a declared manifest is
@@ -79,7 +73,7 @@ describe('buildTree · discovery', () => {
       rootDir,
       sessionDir,
       provider,
-      config: { approval: 'read-only' },
+      config: { approval: 'auto' },
       extraPlugins: [{ id: 'surface-probe', plugin: probe }],
     });
     const order = kernel.roster().map((row) => row.name);
@@ -106,7 +100,7 @@ describe('buildTree · discovery', () => {
       rootDir,
       sessionDir,
       provider,
-      config: { approval: 'read-only', plugins: { entries } },
+      config: { approval: 'auto', plugins: { entries } },
     });
     const row = kernel.roster().find((candidate) => candidate.name === './no-such-plugin-9f3a.mjs');
     expect(row, 'the bad row must still be listed').toBeDefined();
@@ -125,7 +119,7 @@ describe('buildTree · discovery', () => {
       rootDir,
       provider,
       sessionDir,
-      config: { approval: 'read-only' as const, plugins: { entries: [{ id: 'bash', enabled }] } },
+      config: { approval: 'auto' as const, plugins: { entries: [{ id: 'bash', enabled }] } },
     });
 
     // Both halves of "off" at once: the row EXISTS (the panel and the ledger need
@@ -175,7 +169,7 @@ describe('the roster row · a manifest that declares only a tier', () => {
       rootDir,
       sessionDir,
       provider,
-      config: { approval: 'read-only' },
+      config: { approval: 'auto' },
       extraPlugins: [{ id: 'sparse-probe', plugin: sparse }],
     });
     const row = kernel.roster().find((entry) => entry.name === 'sparse-probe');
@@ -185,114 +179,8 @@ describe('the roster row · a manifest that declares only a tier', () => {
     expect(row?.title).toBe('sparse-probe');
     // A description is a supplement, so a missing one leaves the key ABSENT.
     // `'description' in row` is the only question that separates "absent" from
-    // "present and `undefined`": `=== undefined` cannot tell them apart, and this
-    // row's discipline is absence (the same one `clientBundle` follows).
+    // "present and `undefined`": `=== undefined` cannot tell them apart.
     expect('description' in (row as PluginRosterEntry), 'the row must not carry a `description` key').toBe(false);
-    await kernel.dispose();
-  });
-});
-
-describe('the boot graph · settings pages', () => {
-  it('reports `page` only for rows whose own manifest declares one', async () => {
-    const { rootDir, sessionDir } = await dirs();
-    const withPage: Plugin = {
-      name: 'pages-probe',
-      manifest: { title: '有页面', description: 'declares a settings page', tier: 'standard', page: true },
-      apply: () => undefined,
-    };
-    const withoutPage: Plugin = {
-      name: 'no-page-probe',
-      manifest: { title: '无页面', description: 'declares no settings page', tier: 'standard' },
-      apply: () => undefined,
-    };
-    const extraPlugins: readonly PluginEntryOptions[] = [
-      { id: 'pages-probe', plugin: withPage },
-      { id: 'no-page-probe', plugin: withoutPage },
-    ];
-    const kernel = await createAgentKernel({
-      rootDir,
-      sessionDir,
-      provider,
-      config: { approval: 'read-only' },
-      extraPlugins,
-    });
-
-    expect(kernel.roster().find((row) => row.name === 'pages-probe')?.page).toBe(true);
-    // Declaring the manifest without the field is NOT a page: the navigation is
-    // drawn from exactly these rows, and a section nobody answers is worse than
-    // no section.
-    expect(kernel.roster().find((row) => row.name === 'no-page-probe')?.page).toBeUndefined();
-    expect(kernel.roster().find((row) => row.name === 'todo')?.page).toBeUndefined();
-    // Scoped to the rows THIS test built — deliberately NOT "the whole roster
-    // holds exactly one page". That universal claim is a fact about the WORLD,
-    // and a fixture cannot know it: it stayed green only while NO real plugin
-    // declared a page, and it went red the moment one did. What this test can
-    // prove is the projection's faithfulness on the inputs it constructed, so
-    // the inputs (the ids it handed to `extraPlugins`) are what it asserts over.
-    const built = new Set(extraPlugins.map((entry) => entry.id));
-    const invented = kernel.roster().filter((row) => built.has(row.name) && row.page === true).map((row) => row.name);
-    expect(invented).toEqual(['pages-probe']);
-    // Whether anybody REAL declares one is a different question, asked below by
-    // interrogating the real rows instead of trusting a fixture.
-    await kernel.dispose();
-  });
-
-  /**
-   * The test above proves the projection is faithful — it copies a fixture's
-   * `page` flag. It CANNOT prove that anybody declares one, and that is the
-   * defect this second test exists for: the real page owners answered a `page`
-   * operation while declaring nothing, so their settings sections were
-   * unreachable in the real product while every fixture-based test stayed green.
-   *
-   * So the input here is the REAL roster, and "this plugin has a page" is
-   * DERIVED — by asking each active row for one through the same port the
-   * browser uses. No list of page owners is written down anywhere: the sweep
-   * discovers them, then holds the roster's flag to what it just observed.
-   */
-  it('a real row that answers a page declares one — and vice versa', async () => {
-    const { rootDir, sessionDir } = await dirs();
-    const options = { rootDir, provider, sessionDir, config: { approval: 'read-only' as const } };
-    // Every row the product really ships, switched ON. The ids come from the tree
-    // itself (a first pass with no operator entries lists them), so this is the
-    // whole shipped roster — not a hand-picked cast of page owners.
-    const shipped = await buildTree([], [], options);
-    const entries: PluginEntryConfig[] = shipped.map((row) => ({ id: row.id, enabled: true }));
-    const kernel = await createAgentKernel({
-      ...options,
-      config: { approval: 'read-only', plugins: { entries } },
-    });
-
-    const rpc = kernel.pluginRpc();
-    if (rpc === undefined) throw new Error('the kernel always provides the plugin-RPC port');
-
-    const rows = kernel.roster();
-    const answered: string[] = [];
-    for (const row of rows) {
-      // Only a live fiber owns a namespace: an off or failed row cannot answer,
-      // and that is a different fact from "this row has no page".
-      if (row.state !== 'active') continue;
-      try {
-        const descriptor = (await rpc.invoke(row.name, 'page', undefined)) as { title?: unknown };
-        // An answer has to BE a page: resolving `page` with nothing would draw an
-        // empty section, which is the same broken product as no section.
-        expect(typeof descriptor?.title, `${row.name} answered \`page\` without a title`).toBe('string');
-        answered.push(row.name);
-      } catch (err) {
-        // "I have no page" is exactly the two refusals the RPC port itself makes.
-        // Anything else is a fault INSIDE a page implementation, and must not be
-        // silently filed as "this row has no page".
-        expect(err instanceof Error ? err.message : String(err), `${row.name} failed while answering \`page\``)
-          .toMatch(/no loaded plugin answers|unknown operation/u);
-      }
-    }
-
-    // The contract: the roster's `page` flag means "this row answers a page", and
-    // the sweep above is that claim tested against the row's own behaviour.
-    expect(rows.filter((row) => row.page === true).map((row) => row.name).sort()).toEqual(answered.sort());
-    // Not vacuous: the shipped tree really does contain a page owner, found by
-    // ASKING rather than by being told. If this ever empties, the assertion above
-    // has degenerated into comparing two empty lists.
-    expect(answered).toContain('@noa/plugin-ptc');
     await kernel.dispose();
   });
 });
@@ -304,7 +192,7 @@ describe('buildTree · a row that is OFF is not a failure', () => {
       rootDir,
       provider,
       sessionDir,
-      config: { approval: 'read-only' as const, plugins: { entries } },
+      config: { approval: 'auto' as const, plugins: { entries } },
     });
     const shipped = '@noa/plugin-ptc';
     const rowFor = async (entries: PluginEntryConfig[]) => {
@@ -388,7 +276,7 @@ describe('buildTree · a contributor\'s `disabled` is a default, not a second sw
     return buildTree([], entries, {
       rootDir: '.',
       provider,
-      config: { approval: 'read-only' },
+      config: { approval: 'auto' },
       extraPlugins: [contribution],
     });
   }
@@ -437,7 +325,7 @@ describe('buildTree · a contributor\'s `disabled` is a default, not a second sw
       rootDir,
       sessionDir,
       provider,
-      config: { approval: 'read-only' },
+      config: { approval: 'auto' },
       extraPlugins: [{ id: 'contrib-probe', plugin: probe(offRan), disabled: true }],
     });
     const offRow = off.roster().find((row) => row.name === 'contrib-probe');
@@ -453,7 +341,7 @@ describe('buildTree · a contributor\'s `disabled` is a default, not a second sw
       rootDir,
       sessionDir,
       provider,
-      config: { approval: 'read-only', plugins: { entries: [{ id: 'contrib-probe', enabled: true }] } },
+      config: { approval: 'auto', plugins: { entries: [{ id: 'contrib-probe', enabled: true }] } },
       extraPlugins: [{ id: 'contrib-probe', plugin: probe(onRan), disabled: true }],
     });
     expect(on.roster().find((row) => row.name === 'contrib-probe')?.state).toBe('active');
@@ -468,11 +356,11 @@ describe('buildTree · a contributor\'s `disabled` is a default, not a second sw
     // The contract is now one rule for both: a contributed row must carry a plugin,
     // and anything else names its id on the way out.
     const contribution = { id: 'contrib-group', group: true, entries: [] } as unknown as PluginEntryOptions;
-    await expect(buildTree([], [], { rootDir: '.', provider, config: { approval: 'read-only' }, extraPlugins: [contribution] }))
+    await expect(buildTree([], [], { rootDir: '.', provider, config: { approval: 'auto' }, extraPlugins: [contribution] }))
       .rejects.toThrow(/contrib-group/u);
     // …and the plain malformed row keeps its own named refusal, not a silent skip.
     const bare = { id: 'contrib-bare' } as unknown as PluginEntryOptions;
-    await expect(buildTree([], [], { rootDir: '.', provider, config: { approval: 'read-only' }, extraPlugins: [bare] }))
+    await expect(buildTree([], [], { rootDir: '.', provider, config: { approval: 'auto' }, extraPlugins: [bare] }))
       .rejects.toThrow(/contrib-bare/u);
   });
 });

@@ -78,9 +78,10 @@ export class PluginHost {
    * One row as the LOADER holds it, addressed by the id the config uses.
    *
    * Distinct from `roster()`: that is keyed by the plugin's own `name`, a ROW by
-   * its entry id — different for every spec-loaded package (`…plugin-context` vs
-   * `context`). Anything reporting on a row must ask here, or an active plugin
-   * reads as missing. `entries()` is the whole list, off and failed rows too.
+   * its entry id — different for every spec-loaded package (`…channel-qq` vs
+   * `@noa/channel-qq`). Anything reporting on a row must ask here, or an active
+   * plugin reads as missing. `entries()` is the whole list, off and failed rows
+   * too.
    */
   entry(id: string): PluginEntry | undefined {
     return this.loader.get(id);

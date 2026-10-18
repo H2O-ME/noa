@@ -83,7 +83,7 @@ async function assemble(opts: {
     rootDir: root,
     provider: provider(),
     config: {
-      approval: 'read-only',
+      approval: 'auto',
       ...(opts.entries !== undefined ? { plugins: { entries: opts.entries } } : {}),
       ...(opts.skillsDisable !== undefined ? { skillsDisable: opts.skillsDisable } : {}),
     },

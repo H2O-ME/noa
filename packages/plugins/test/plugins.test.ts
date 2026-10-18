@@ -132,7 +132,7 @@ describe('PluginHost', () => {
     await expect(host.agentHooks().beforeLLMCall!({ messages: [], tools })).rejects.toThrow(/added tools/);
   });
 
-  it('lets beforeLLMCall hooks narrow the tool set (PTC projection)', async () => {
+  it('lets beforeLLMCall hooks narrow the tool set (hooks may remove, never add)', async () => {
     const host = new PluginHost('.');
     await host.sync(rowsOf([{
       name: 'narrow',
@@ -197,14 +197,13 @@ describe('PermissionService', () => {
       answers.push(`${call.name}:${kind}`);
       return 'allow';
     };
-    const readOnly = new PermissionService('read-only', ask);
-    expect(await readOnly.decide('read_file', 'read', call('read_file'))).toBe('allow');
-    expect(await readOnly.decide('write_file', 'write', call('write_file'))).toBe('allow'); // via ask
-    expect(answers).toEqual(['write_file:write']);
-
-    const autoEdit = new PermissionService('auto-edit', ask);
-    expect(await autoEdit.decide('write_file', 'write', call('write_file'))).toBe('allow');
-    expect(await autoEdit.decide('bash', 'execute', call('bash'))).toBe('allow'); // via ask
+    const auto = new PermissionService('auto', ask);
+    // Reads and workspace writes are auto-allowed — the asker is never consulted.
+    expect(await auto.decide('read_file', 'read', call('read_file'))).toBe('allow');
+    expect(await auto.decide('write_file', 'write', call('write_file'))).toBe('allow');
+    // Everything else goes to the gate (the smart reviewer in production).
+    expect(await auto.decide('bash', 'execute', call('bash'))).toBe('allow'); // via ask
+    expect(answers).toEqual(['bash:execute']);
 
     const full = new PermissionService('full', async () => 'deny');
     expect(await full.decide('bash', 'execute', call('bash'))).toBe('allow');
@@ -216,16 +215,13 @@ describe('PermissionService', () => {
       answers.push(`${call.name}:${kind}`);
       return 'always';
     };
-    const readOnly = new PermissionService('read-only', ask);
-    expect(await readOnly.decide('read_file', 'read-external', call('read_file'))).toBe('allow'); // via ask
+    const auto = new PermissionService('auto', ask);
+    expect(await auto.decide('read_file', 'read-external', call('read_file'))).toBe('allow'); // via ask
     expect(answers).toEqual(['read_file:read-external']);
 
     // "always" is remembered per tool+kind, so later external reads pass free
-    expect(await readOnly.decide('read_file', 'read-external', call('read_file'))).toBe('allow');
+    expect(await auto.decide('read_file', 'read-external', call('read_file'))).toBe('allow');
     expect(answers).toEqual(['read_file:read-external']);
-
-    const autoEdit = new PermissionService('auto-edit', ask);
-    expect(await autoEdit.decide('list_dir', 'read-external', call('list_dir'))).toBe('allow'); // via ask
 
     const full = new PermissionService('full', async () => {
       throw new Error('must not ask');
@@ -235,7 +231,7 @@ describe('PermissionService', () => {
 
   it('remembers bash "always" by command program prefix, other tools by name', async () => {
     let asked = 0;
-    const permission = new PermissionService('read-only', async () => {
+    const permission = new PermissionService('auto', async () => {
       asked += 1;
       return 'always';
     });
@@ -249,14 +245,14 @@ describe('PermissionService', () => {
     expect(await permission.decide('bash', 'execute', rmCall)).toBe('allow');
     expect(asked).toBe(2);
     // non-execute tools still remember per tool name
-    expect(await permission.decide('write_file', 'write', call('write_file'))).toBe('allow');
-    expect(await permission.decide('write_file', 'write', call('write_file'))).toBe('allow');
+    expect(await permission.decide('read_external', 'read-external', call('read_external'))).toBe('allow');
+    expect(await permission.decide('read_external', 'read-external', call('read_external'))).toBe('allow');
     expect(asked).toBe(3);
   });
 
   it('remembers "always" for a compound command as the whole chain, not one program', async () => {
     let asked = 0;
-    const permission = new PermissionService('read-only', async () => {
+    const permission = new PermissionService('auto', async () => {
       asked += 1;
       return 'always';
     });
@@ -279,7 +275,7 @@ describe('PermissionService', () => {
 
   it('treats a pipe chain as compound (whole-command memory)', async () => {
     let asked = 0;
-    const permission = new PermissionService('read-only', async () => {
+    const permission = new PermissionService('auto', async () => {
       asked += 1;
       return 'always';
     });
@@ -293,7 +289,7 @@ describe('PermissionService', () => {
   });
 
   it('fails closed when the asker throws, and never-policy denies without asking', async () => {
-    const throwing = new PermissionService('read-only', async () => {
+    const throwing = new PermissionService('auto', async () => {
       throw new Error('UI blew up');
     });
     expect(await throwing.decide('bash', 'execute', call('bash'))).toBe('deny');
@@ -301,7 +297,7 @@ describe('PermissionService', () => {
     let asked = 0;
     const audits: string[] = [];
     const permission = new PermissionService(
-      'read-only',
+      'auto',
       async () => {
         asked += 1;
         return 'allow';
@@ -344,14 +340,14 @@ describe('the approval gate is a plugin', () => {
 
   it('surfaces a DenyGrant reason to the model as "by user: <text>"', async () => {
     const denied = await hostWithGate(
-      new PermissionService('read-only', async () => ({ answer: 'deny', reason: '别碰 CI' })),
+      new PermissionService('auto', async () => ({ answer: 'deny', reason: '别碰 CI' })),
     );
     expect(await denied.agentHooks().beforeToolCall!(call('boom'))).toEqual({
       action: 'deny',
       reason: 'by user: 别碰 CI',
     });
     // 无理由的普通 deny 保持旧文案。
-    const plain = await hostWithGate(new PermissionService('read-only', async () => 'deny'));
+    const plain = await hostWithGate(new PermissionService('auto', async () => 'deny'));
     expect(await plain.agentHooks().beforeToolCall!(call('boom', 'c2'))).toEqual({
       action: 'deny',
       reason: 'by user',
@@ -381,6 +377,12 @@ describe('builtinPlugins', () => {
       'bash',
       'jobs',
       'todo_write',
+      // Both web tools are unconditional. `web_search` used to register only when
+      // this row's config named a search endpoint (「一个查不到的搜索工具比没有更糟」),
+      // but it now falls back to a keyless backend, so it can always search — see
+      // `builtin/web.ts` for the ladder.
+      'web_fetch',
+      'web_search',
       // Unconditional, unlike the opt-in tools below: a surface with no human to
       // ask still registers it, so the model learns that from the refusal rather
       // than from an absent tool (see `builtin/ask-user.ts`).

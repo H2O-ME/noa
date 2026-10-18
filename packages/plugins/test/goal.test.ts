@@ -24,7 +24,7 @@ async function harness(): Promise<Awaited<ReturnType<typeof createAgentKernel>>>
   const dir = await mkdtemp(path.join(tmpdir(), 'nova-goal-'));
   return createAgentKernel({
     rootDir: dir,
-    config: { approval: 'read-only' },
+    config: { approval: 'auto' },
     sessionDir: path.join(dir, 'sessions'),
     provider: {
       async *stream() {

@@ -1,8 +1,8 @@
 {
-  "name": "@noa/plugin-context",
+  "name": "@noa/plugin-memory",
   "version": "0.1.0",
   "type": "module",
-  "description": "上下文洞察插件（advanced 档，按 spec 装载）：会话窗口折叠；缺失不影响主程序。",
+  "description": "记忆插件：MEMORY.md / USER.md 策展记忆 + 本地向量索引（记忆条目 + 历史会话语义检索）。",
   "exports": {
     ".": {
       "types": "./dist/index.d.mts",

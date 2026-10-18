@@ -187,7 +187,7 @@ describe('configured surfaces as kernel plugin rows', () => {
       rootDir: await dir(),
       sessionDir: await dir(),
       provider: provider(),
-      config: { approval: 'read-only' },
+      config: { approval: 'auto' },
       surfaces: { registry, loaded: [custom] },
     });
 

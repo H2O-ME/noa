@@ -62,7 +62,7 @@ async function runningAsk(args: unknown, opts: { userQuestions?: boolean } = {})
   const kernel = await createAgentKernel({
     rootDir: dir,
     provider: provider([askScript(args), closing]),
-    config: { approval: 'read-only' },
+    config: { approval: 'auto' },
     sessionDir: await tmp(),
     ...(opts.userQuestions === true ? { userQuestions: true } : {}),
   });
@@ -176,7 +176,7 @@ describe('ask-user plugin, no answerer (the headless surfaces)', () => {
     const kernel = await createAgentKernel({
       rootDir: dir,
       provider: provider([askScript({ questions: QUESTIONS }), closing]),
-      config: { approval: 'read-only' },
+      config: { approval: 'auto' },
       sessionDir: await tmp(),
     });
     const events: KernelEvent[] = [];

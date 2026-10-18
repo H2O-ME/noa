@@ -40,10 +40,17 @@ function normalizeAsk(raw: unknown): AskResult {
 }
 
 /**
- * Three-tier approval (codex-style):
- * - read-only: reads auto-allowed; write/execute/network ask
- * - auto-edit: reads + workspace writes auto-allowed; execute/network ask
- * - full: everything allowed
+ * Two-tier approval:
+ * - auto: reads, in-workspace writes and network READS are auto-allowed;
+ *   `execute` and `read-external` ask — which in this product means the SMART
+ *   gate (a reviewer model, with a human only when the reviewer is unsure). See
+ *   `reviewer.ts`. What the gate protects is the machine and the operator's own
+ *   files, not the act of looking something up (see `autoAllows`).
+ * - full: everything allowed.
+ *
+ * Writes are always inside the workspace root (the fs tools resolve through
+ * `resolveInRoot`, which refuses to escape it), so `write` IS the
+ * "workspace write" the tier means; there is no out-of-root write to gate.
  *
  * An "always" answer is remembered for the rest of the session, scoped to
  * WHAT was approved (dsh's allowed-once lesson, one notch looser):
@@ -105,7 +112,7 @@ export class PermissionService {
     return this.mode;
   }
 
-  /** Runtime switch (e.g. the /approvals command). Per session, not per kernel. */
+  /** Runtime switch (e.g. the /perm command). Per session, not per kernel. */
   setMode(mode: ApprovalMode): void {
     this.mode = mode;
   }
@@ -122,10 +129,31 @@ export class PermissionService {
   private autoAllows(kind: PermissionKind): boolean {
     if (this.mode === 'full') return true;
     if (kind === 'read') return true;
-    // Reads reaching outside the workspace root are gated in every mode
-    // except `full`: the sandbox boundary is exactly what they cross.
-    if (kind === 'read-external') return false;
-    if (kind === 'write') return this.mode === 'auto-edit';
+    // In-workspace writes are the ordinary way a coding agent works; the fs
+    // tools cannot write outside the root anyway (resolveInRoot refuses), so
+    // there is nothing here for the gate to weigh.
+    if (kind === 'write') return true;
+    // 联网**读**：抓一个 URL 改不了这台机器上的任何东西，而「查一下」正是操作者要的事。
+    // 把它挡在闸门后，等于每一次查资料都把整轮运行停住等一张卡 —— 对一个无人值守、只在
+    // 手机上看的 bot 来说这是最糟的失败模式（超时即拒，而人可能几小时后才看见），而且它
+    // 并不是这道闸门存在的理由。
+    //
+    // Hermes 把线划在同一个位置：它的审批管 bash 命令与文件写入
+    // （`tools/approval_floors.py`、`file_tools_write_guards.py`），联网工具**从不**过闸
+    // （`tools/web_tools.py` 里没有任何 approval 引用）；出网安全靠 `tools/url_safety.py`
+    // 加一份**可选**的站点黑名单，而不是靠打断运行去问人。Noa 的对应物是
+    // `isSafeHttpUrl`（每一跳都过，只允许公网 http/https）。
+    //
+    // 残余风险写在这里而不是藏着：联网读自动放行，加上工作区文件本就可自动读，意味着一个
+    // 被注入的页面能诱导模型把工作区内容塞进 URL 发出去。Hermes 同样如此（它的联网工具也
+    // 不过闸），所以这不是本产品新开的口子；要收紧，扩展点是站点黑名单，不是把每一次抓取
+    // 都变成一张卡。
+    //
+    // 注意这条只管**读**：将来若有会**发送**数据的联网工具（上传、发帖、改远端状态），
+    // 那属于 `execute` 那一类，不要复用这个种类。
+    if (kind === 'network') return true;
+    // `read-external` reaches into the operator's own files outside the
+    // workspace, and `execute` can do anything: both go to the gate in `auto`.
     return false;
   }
 

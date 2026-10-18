@@ -10,6 +10,7 @@
  * one is never a change to this package.
  */
 export * from './permission.js';
+export * from './reviewer.js';
 export * from './host.js';
 export * from './toolbox.js';
 export * from './hooks.js';

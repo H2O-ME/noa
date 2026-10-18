@@ -128,7 +128,7 @@ describe('configured rows: the app anchor, and what a CLOSED row reports', () =>
       rootDir: app,
       sessionDir,
       provider,
-      config: { approval: 'read-only', plugins: { entries: [{ id: missing, enabled }] } },
+      config: { approval: 'auto', plugins: { entries: [{ id: missing, enabled }] } },
     });
 
     const off = await boot(false);

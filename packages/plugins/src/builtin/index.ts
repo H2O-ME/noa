@@ -6,9 +6,20 @@ import { goalPlugin, type GoalPluginOptions } from './goal.js';
 import { jobsPlugin } from './jobs.js';
 import { searchPlugin } from './search.js';
 import { todoPlugin } from './todo.js';
+import { webPlugin } from './web.js';
 import { workspacePlugin, type WorkspacePluginOptions } from './workspace.js';
 
 export { askUserPlugin, parseQuestions, type AskUserPluginOptions } from './ask-user.js';
+export {
+  htmlToText,
+  decodeEntities,
+  formatSearchResults,
+  formatTinyFishResults,
+  formatDuckDuckGoResults,
+  parseDuckDuckGoResults,
+  resolveSearchBackend,
+  type WebPluginConfig,
+} from './web.js';
 
 export interface BuiltinOptions {
   /**
@@ -77,6 +88,10 @@ export function builtinPlugins(options: BuiltinOptions): Plugin[] {
     bashPlugin(),
     jobsPlugin(),
     todoPlugin(),
+    // The web tools. Always buildable (see the docstring): both register
+    // unconditionally — `web_search` walks a backend ladder that ends in a
+    // keyless one when this row's config names no search endpoint (see `web.ts`).
+    webPlugin(),
   ];
   // Present only when the assembly supplied a live-goal reader and a log writer
   // (see `BuiltinOptions.goal`): without them the tools could report a goal no

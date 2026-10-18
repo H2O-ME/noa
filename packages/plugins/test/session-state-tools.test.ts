@@ -39,7 +39,7 @@ describe('ownsSessionState declaration', () => {
 
   it('is NOT declared by stateless builtins', async () => {
     const tools = await builtins();
-    for (const name of ['bash', 'read_file', 'list_dir', 'jobs', 'get_time']) {
+    for (const name of ['bash', 'read_file', 'list_dir', 'jobs']) {
       expect(tools.get(name)?.ownsSessionState ?? false).toBe(false);
     }
   });

@@ -15,8 +15,6 @@ import type {
   LlmService,
   ModelControl,
   PermissionPort,
-  PluginClientBundle,
-  PluginRpc,
   PluginTier,
   SessionEnvInfo,
 } from '@noa/core';
@@ -129,8 +127,8 @@ export interface Kernel {
    * injects the `sessions` service and calls `sessions.activate(agent)`
    * directly. In-repo surface switches (`/resume`, web session switch) create
    * and make current in one step via `newAgentSession`, so this member has no
-   * production caller in the repo today — it is a kernel-handle seam like
-   * `routes`, not a wired path.
+   * production caller in the repo today — it is a kernel-handle seam, not a
+   * wired path.
    */
   activateSession(agent: AgentSession): void;
   /** Re-point the tool root + docs + skills + host at another directory. */
@@ -140,24 +138,14 @@ export interface Kernel {
    * uses.
    *
    * Deliberately by ID and untyped: the kernel has no opinion about any plugin's
-   * settings shape, and a consumer that needs them (a command that displays the
-   * code mode, a surface that renders a status) names the row itself. This
-   * replaced a typed `codeMode()` member, which put one plugin's vocabulary
-   * (`PtcMode`) into the contract every surface implements.
+   * settings shape, and a consumer that needs them (a command that displays a
+   * budget, a surface that renders a status) names the row itself. This replaced
+   * a typed `codeMode()` member, which put one plugin's vocabulary into the
+   * contract every surface implements.
    * @param id - the row's id; `undefined` when no such row exists.
    * @returns the row's config, or undefined when the row is absent or has none.
    */
   pluginConfig(id: string): unknown;
-  /**
-   * Every loaded plugin's operations, by the id its config row uses.
-   *
-   * Absent only when the assembly provided no registry (an embedded kernel with a
-   * hand-built container), which is why it is a method returning undefined rather
-   * than a hard dependency: a surface that has no plugin pages simply never calls
-   * it, and one that does gets the same registry the plugins registered with.
-   * @returns the registry, or undefined when this assembly has none.
-   */
-  pluginRpc(): PluginRpc | undefined;
   /** Unload every plugin (a clean shutdown; process exit is the usual path). */
   dispose(): Promise<void>;
 }
@@ -201,26 +189,6 @@ export interface PluginRosterEntry {
    * off, has no error to report.
    */
   error?: string;
-  /**
-   * Whether this plugin answers a settings `page` operation, from its manifest.
-   * The browser derives its settings navigation from this flag alone.
-   */
-  page?: boolean;
-  /**
-   * The plugin's BROWSER-side bundle, when it ships one. Absent means the
-   * plugin is server-only (the common case — most plugins extend the kernel
-   * container with tools/services and need nothing in the browser beyond what
-   * the host already ships). A plugin that contributes UI capabilities
-   * (fence renderers, genui panels) declares where its client bundle is served
-   * so the browser loader can fetch and register it on boot.
-   *
-   * `rev` rides the boot graph: a plugin rebuild bumps it, which busts the
-   * loader's per-entry memo together with the host's immutable asset caching.
-   * The path is served by the host's `RouteRegistry` under the same prefix
-   * (`/plugins/<name>/client.js`) — the loader builds that URL from the
-   * plugin's name, so the bundle is discoverable without a separate manifest.
-   */
-  clientBundle?: PluginClientBundle;
 }
 
 /** Where a roster row came from (the plugin manager's grouping axis). */
@@ -249,8 +217,4 @@ export interface PluginDescriptor {
   description?: string;
   /** Why a row has no fiber although it should have one; see `PluginRosterEntry.error`. */
   error?: string;
-  /** Whether the plugin answers a settings `page` operation; see `PluginRosterEntry.page`. */
-  page?: boolean;
-  /** The plugin's browser bundle; see `PluginRosterEntry.clientBundle`. */
-  clientBundle?: PluginClientBundle;
 }

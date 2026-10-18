@@ -57,7 +57,7 @@ async function kernelWithTool() {
   return await createAgentKernel({
     rootDir: await tmp(),
     provider: provider([[{ type: 'text_delta', text: 'ok' }]]),
-    config: { approval: 'read-only' },
+    config: { approval: 'auto' },
     sessionDir: await tmp(),
     extraPlugins: [{ id: 'boom', plugin: boomPlugin() }],
   });
@@ -79,7 +79,7 @@ describe('per-session permission scope', () => {
   it('decides each call with the engine of the session that issued it', async () => {
     const kernel = await kernelWithTool();
     const a = await kernel.newAgentSession();
-    a.setApprovalMode('read-only');
+    a.setApprovalMode('auto');
     const stopA = answerer(a, 'deny');
     const b = await kernel.newAgentSession();
     b.setApprovalMode('full');
@@ -203,12 +203,12 @@ describe('per-session permission scope', () => {
     const kernel = await kernelWithTool();
     const a = await kernel.newAgentSession();
     const b = await kernel.newAgentSession();
-    a.setApprovalMode('auto-edit');
+    a.setApprovalMode('auto');
     b.setApprovalMode('full');
     kernel.activateSession(a);
-    expect(kernel.permission.approvalMode).toBe('auto-edit');
-    kernel.permission.setMode('read-only');
-    expect(a.approvalMode).toBe('read-only');
+    expect(kernel.permission.approvalMode).toBe('auto');
+    kernel.permission.setMode('auto');
+    expect(a.approvalMode).toBe('auto');
     expect(b.approvalMode).toBe('full');
     kernel.activateSession(b);
     expect(kernel.permission.approvalMode).toBe('full');

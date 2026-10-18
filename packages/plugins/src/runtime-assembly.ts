@@ -7,9 +7,10 @@
  * this one by whoever calls `createAgentKernel`, that one by every caller of
  * the resulting handle.
  */
-import type { ChatProvider, ModelCatalogPort, PluginEntryOptions, SubagentProgress, SurfaceRows } from '@noa/core';
+import type { ChatProvider, EmbeddingClient, ModelCatalogPort, ModelDefaultsPort, PluginEntryOptions, PricingTable, SubagentProgress, SurfaceRows, TranscriptionClient } from '@noa/core';
 import type { PluginEntryConfig } from './plugin-tree.js';
 import type { ApprovalMode } from './permission.js';
+import type { CallReviewer } from './reviewer.js';
 
 /** The surface-independent slice of `~/.noa/config.json` the kernel needs. */
 export interface KernelConfig {
@@ -62,6 +63,16 @@ export interface CreateKernelOptions {
    * release from this product.
    */
   modelCatalog?: ModelCatalogPort;
+  /**
+   * Where to write a model down as this deployment's DEFAULT (`/model default`).
+   *
+   * A different authority from `modelCatalog`: that one decides what may be
+   * PICKED, this one writes the config so the NEXT process starts there. Supplied
+   * by the host that owns the config file — the kernel has no business knowing
+   * where a deployment keeps its settings, and a surface that omits it gets an
+   * honest "nowhere to write it" instead of a switch that evaporates on restart.
+   */
+  modelDefaults?: ModelDefaultsPort;
   /** Resume an existing JSONL log for the FIRST session handle. */
   resumeFile?: string;
   /** Plugins the owning surface contributes, each with the id its config uses. */
@@ -127,6 +138,52 @@ export interface CreateKernelOptions {
    * means no titles — every listing falls back to the first prompt.
    */
   titleProvider?: () => Promise<ChatProvider | undefined>;
+  /**
+   * The smart-approval reviewer: a SEPARATE model call that classifies a gated
+   * tool call before the human is bothered (see `reviewer.ts`). The assembly owns
+   * where the model comes from (this product reuses the endpoint with
+   * `reviewModel`). Absent = no smart gate; every non-auto-allowed call asks the
+   * human directly.
+   */
+  reviewer?: CallReviewer;
+  /**
+   * The embedding client, when the install has an embedding model.
+   *
+   * Built by the SURFACE, not here: it needs the endpoint's `baseURL`/`apiKey`,
+   * and only the surface holds the operator's config — the same reason `reviewer`
+   * is injected rather than constructed. The assembly publishes it as the
+   * `embeddings` capability, which is how a plugin (the memory system) reaches
+   * vectors without ever seeing a credential.
+   *
+   * Absent is a supported state, not a misconfiguration: a consumer degrades
+   * (the memory plugin falls back to keyword scoring) instead of failing to load.
+   */
+  embedder?: EmbeddingClient;
+  /**
+   * The transcription client, when the install has a speech-to-text model.
+   *
+   * Built by the SURFACE, exactly like `embedder`: it needs the endpoint's
+   * `baseURL`/`apiKey`, and only the surface holds the operator's config. The
+   * assembly publishes it as the `transcription` capability, which is how the QQ
+   * channel turns an inbound voice message into text without ever seeing a
+   * credential.
+   *
+   * Absent is a supported state, not a misconfiguration: the channel answers
+   * 「收到一条语音，未配置转写」and keeps the rest of the message.
+   */
+  transcriber?: TranscriptionClient;
+  /**
+   * What each model costs, when the deployment wrote a price table.
+   *
+   * Held by the SURFACE for the same reason as the two clients above (it is a
+   * line in the operator's config file) and published as the `pricing`
+   * capability, which is how the QQ channel's `/usage` turns token totals into an
+   * estimate without the kernel knowing anything about billing.
+   *
+   * Absent is a supported state: a reader then reports tokens and says the model
+   * is unpriced. See `core/pricing.ts` for why absence is spelled as absence.
+   */
+  pricing?: PricingTable;
   /**
    * The config file, as this kernel is allowed to touch it.
    *

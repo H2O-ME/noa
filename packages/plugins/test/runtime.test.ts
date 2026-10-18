@@ -102,7 +102,7 @@ async function tmp(): Promise<string> {
   return mkdtemp(path.join(tmpdir(), 'nova-kernel-asm-'));
 }
 
-const baseConfig = { approval: 'read-only' as const };
+const baseConfig = { approval: 'auto' as const };
 
 describe('createAgentKernel', () => {
   it('seeds the context fragment and workspace marker into a fresh session', async () => {

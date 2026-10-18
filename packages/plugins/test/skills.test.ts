@@ -58,7 +58,7 @@ async function kernelFor(rootDir: string): Promise<Awaited<ReturnType<typeof cre
   return createAgentKernel({
     rootDir,
     provider: provider(),
-    config: { approval: 'read-only' },
+    config: { approval: 'auto' },
     sessionDir: await mkdtemp(path.join(tmpdir(), 'nova-agents-s-')),
   });
 }

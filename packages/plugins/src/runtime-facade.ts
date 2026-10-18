@@ -10,30 +10,29 @@
 import {
   jobs as jobsKey,
   llm as llmKey,
-  pluginRpc as pluginRpcKey,
+  modelControl as modelControlKey,
   sessions as sessionsKey,
   type AgentHooks,
   type AgentSession,
-  type ModelCatalogPort,
 } from '@noa/core';
 import type { PluginHost } from './host.js';
 import type { SkillMetadata } from './skills.js';
 import type { Environment } from './runtime-env.js';
 import { jobListener } from './job-listener.js';
 import { commandRunner } from './kernel-commands.js';
-import { modelControl } from './runtime-models.js';
 import { setWorkspace } from './runtime-workspace.js';
 import type { Kernel } from './runtime-types.js';
 
-export function facade(env: Environment, modelCatalog?: ModelCatalogPort): Kernel {
+export function facade(env: Environment): Kernel {
   const host = (): PluginHost => {
     if (env.state.host === undefined) throw new Error('kernel has no active tool host');
     return env.state.host;
   };
-  // Built once: the control reads everything else live through the env, so a
-  // workspace rebuild or a session switch cannot leave it holding a stale
-  // collaborator.
-  const models = modelCatalog === undefined ? undefined : modelControl(env, modelCatalog);
+  // Read from the container rather than built here: the SAME instance is what the
+  // `model-control` service publishes to plugins, and two instances would let a
+  // `/model` from the chat window and a picker in a surface disagree about which
+  // model is in force.
+  const models = env.root.get(modelControlKey);
   const commands = commandRunner(env);
   return {
     get agent(): AgentSession {
@@ -96,7 +95,6 @@ export function facade(env: Environment, modelCatalog?: ModelCatalogPort): Kerne
     sessionEnv: () => env.sessionEnv(),
     buildFragment: env.buildFragment,
     pluginConfig: (id) => env.state.rows.find((row) => row.id === id)?.config,
-    pluginRpc: () => env.root.get(pluginRpcKey),
     newAgentSession: (sessionOpts) => env.openCurrent(sessionOpts),
     activateSession: (agent) => {
       env.root.must(sessionsKey).activate(agent);

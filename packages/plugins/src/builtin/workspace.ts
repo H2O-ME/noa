@@ -61,7 +61,7 @@ export function workspacePlugin(options: WorkspacePluginOptions): Plugin {
           },
         },
         // Moving the operating root is a user-visible change of scope — same
-        // gate class as executing a command (asks in read-only/auto-edit).
+        // gate class as executing a command (always reviewed in `auto`).
         'execute',
       );
     },

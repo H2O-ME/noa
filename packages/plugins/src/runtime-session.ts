@@ -26,6 +26,7 @@ import {
   type UserMessage,
 } from '@noa/core';
 import type { ApprovalPolicyCell } from './permission.js';
+import type { CallReviewer } from './reviewer.js';
 import { makeSessionAskWiring } from './session-ask.js';
 import type { KernelConfig } from './runtime-types.js';
 
@@ -79,6 +80,12 @@ export interface OpenSessionDeps {
   inputModalities?: () => Promise<readonly string[] | undefined>;
   /** The title model's client accessor, handed straight to the session engine. */
   titleProvider?: () => Promise<ChatProvider | undefined>;
+  /**
+   * The smart-approval reviewer, when the assembly has one. Reaches the session's
+   * ask wiring, where it is composed in front of the human answerer (see
+   * `session-ask.ts`). Absent = every gated call asks the human directly.
+   */
+  reviewer?: CallReviewer;
 }
 
 /**
@@ -104,6 +111,7 @@ export async function openAgentSession(
     rootDir: p.rootDir,
     tools: p.tools,
     policyCell: p.policyCell,
+    ...(p.reviewer === undefined ? {} : { reviewer: p.reviewer }),
     audit: (entry) => {
       // Log-only, and a failure to record an audit line must not fail the call
       // it describes; the verdict itself already settled.

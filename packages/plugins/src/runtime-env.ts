@@ -45,10 +45,11 @@ import type { CreateKernelOptions, PluginRosterEntry } from './runtime-types.js'
 import type { PluginEntryConfig } from './plugin-tree.js';
 import type { PluginRow } from './plugin-tree.js';
 import { jobListener } from './job-listener.js';
+import { modelControl } from './runtime-models.js';
 import { openAgentSession, type OpenSessionOptions, type PermissionService } from './runtime-session.js';
 import { makeKernelAskWiring, kernelAskAudit } from './session-ask.js';
 import type { ApprovalPolicyCell } from './permission.js';
-import { executionEnvironmentProvider, pluginConfigProvider, pluginRpcProvider } from './plugin-services.js';
+import { embeddingsProvider, executionEnvironmentProvider, modelControlProvider, modelDefaultsProvider, pluginConfigProvider, pricingProvider, transcriptionProvider } from './plugin-services.js';
 import {
   approvalProvider,
   compactionProvider,
@@ -231,6 +232,7 @@ export function createEnvironment(opts: CreateKernelOptions): Environment {
     rootDir: () => state.rootDir,
     tools: () => root.get(toolsKey)?.all() ?? [],
     policyCell,
+    ...(opts.reviewer === undefined ? {} : { reviewer: opts.reviewer }),
     // Only session-less calls route here (kernel tests, embedders); a real
     // conversation audits into its own log (`openAgentSession`).
     audit: kernelAskAudit(() => root.get(sessionsKey)?.current()),
@@ -279,9 +281,25 @@ export function createEnvironment(opts: CreateKernelOptions): Environment {
   //
   // Order is a contract: a consumer activated before its provider would find the
   // service absent, so these stay at the head of the tree.
+  // Built once, not per spread: `embeddingsProvider` returns a NEW plugin object
+  // each call, and the loader diffs rows by plugin identity — two calls would
+  // look like a different provider and re-activate the seam on every roster.
+  const embedderProvider = embeddingsProvider(opts.embedder);
+  // Same conditional-publish discipline as the embedding seam: a voice-capable
+  // channel reads this with `ctx.get` and degrades to 「未配置转写」when absent.
+  const transcriberProvider = transcriptionProvider(opts.transcriber);
+  // Same conditional-publish discipline once more: no `pricing` in the config
+  // means no price table, and a cost reader reports tokens only.
+  const pricingSeam = pricingProvider(opts.pricing);
+  // 模型座位：目录没给就没有座位（`/model` 会如实说本进程不支持切换）。门面与插件读
+  // 的是**同一个实例**，所以一次切换对所有读者立即可见，也不会出现「门面切了、插件
+  // 手里的还是旧的」。
+  const modelSeat = modelControlProvider(
+    opts.modelCatalog === undefined ? undefined : modelControl(env, opts.modelCatalog),
+  );
+  const modelDefaultsSeam = modelDefaultsProvider(opts.modelDefaults);
   const providers: Plugin[] = [
     executionEnvironmentProvider(env, opts),
-    pluginRpcProvider(),
     // The port that writes the durable tree re-rosters through the SAME path the
     // settings panel uses, so a plugin's save and a panel switch cannot disagree
     // about what "applied" means.
@@ -294,6 +312,15 @@ export function createEnvironment(opts: CreateKernelOptions): Environment {
     jobsProvider(jobs),
     spillProvider(),
     compactionProvider(),
+    // Provided ONLY when the install has an embedding model. A consumer reads it
+    // with `ctx.get` and degrades to keyword scoring when it is absent — which is
+    // why absence is spelled as an absent service and not as a client that
+    // throws: a consumer can act on the first and only trip over the second.
+    ...(embedderProvider === undefined ? [] : [embedderProvider]),
+    ...(transcriberProvider === undefined ? [] : [transcriberProvider]),
+    ...(pricingSeam === undefined ? [] : [pricingSeam]),
+    ...(modelSeat === undefined ? [] : [modelSeat]),
+    ...(modelDefaultsSeam === undefined ? [] : [modelDefaultsSeam]),
     skillsProvider(() => state.skills, () => loadWorkspace(env, config.projectDocMaxTokens)),
     sessionsProvider(env.openSession),
     // The surface registry, provided INTO the container. The instance is built
@@ -355,6 +382,7 @@ async function openSession(
         env.root.must(compactionKey).run(options),
       perRequestCompact: opts.perRequestCompact === true,
       ...(opts.titleProvider === undefined ? {} : { titleProvider: opts.titleProvider }),
+      ...(opts.reviewer === undefined ? {} : { reviewer: opts.reviewer }),
       // Input modalities of the model in force, read per request. The provider
       // is the authority on WHICH model is active (`ChatProvider.model`) and the
       // catalog answers what that id can accept, so this reads both live rather

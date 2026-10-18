@@ -152,15 +152,14 @@ export function surfaceRows(env: Environment, opts: CreateKernelOptions): readon
  *
  * A switched-off or unloadable row has no fiber, so its row comes from the tree
  * the roster built — build this from the LIVE plugins instead and a turned-off
- * plugin would vanish from the very page that turns it back on.
+ * plugin would vanish from the very panel that turns it back on.
  *
  * The live half is read from the LOADER by row id, not from `root.roster()`.
  * Those two keyings differ for every spec-loaded package: the container knows a
  * fiber by the plugin's own `name` (`context`), while the ROW — the thing the
  * operator's config names, switches, and reads errors from — is keyed by the
- * entry id (`@noa/plugin-context`). Matching on the container's key made
- * an active plugin report `disabled`, which then hid its settings page (nav is
- * derived from `page && enabled`) and made its switch unverifiable.
+ * entry id (`@noa/channel-qq`). Matching on the container's key made an active
+ * plugin report `disabled`, which then made its switch unverifiable.
  * @param env - the live environment.
  * @returns one entry per row, with its live container state when it has one.
  */
@@ -181,18 +180,12 @@ export function describePlugins(env: Environment): PluginRosterEntry[] {
       // field below may be assumed present. `title` is a slot every row fills, so
       // it falls back to the row id — the same fallback `manifestOf` applies to a
       // plugin with no manifest at all. `description` is a SUPPLEMENT, not a slot,
-      // so a missing one stays ABSENT (the `clientBundle` discipline below), and
-      // the guard keeps its pre-refactor form because the declared `string` is a
-      // promise the runtime cannot hold a JS plugin to.
+      // so a missing one stays ABSENT, and the guard keeps its pre-refactor form
+      // because the declared `string` is a promise the runtime cannot hold a JS
+      // plugin to.
       title: row.manifest.title ?? row.id,
       ...(row.manifest.description !== undefined && row.manifest.description.length > 0 ? { description: row.manifest.description } : {}),
       ...(error !== undefined ? { error } : {}),
-      ...(row.manifest.page === true ? { page: true } : {}),
-      // The boot graph's producer half: a plugin that declares a browser bundle
-      // is copied through verbatim, and one that declares none keeps the field
-      // ABSENT. `undefined` would be the same JSON on the wire but a different
-      // fact for every reader that asks `'clientBundle' in row`.
-      ...(row.manifest.clientBundle !== undefined ? { clientBundle: row.manifest.clientBundle } : {}),
     };
     if (fiber === undefined) {
       // An enabled row with no fiber is FAILED, not off: the panel's failed

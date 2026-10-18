@@ -83,7 +83,7 @@ describe('renderToolsSdk', () => {
     expect(renderToolsSdk([...tools].reverse())).toBe(sdk);
   });
 
-  it('slim mode replaces parameter types with Record<string, unknown> for `both` mode', () => {
+  it('slim mode replaces parameter types with Record<string, unknown>', () => {
     const tools = [
       tool('aaa', { type: 'object', properties: { q: { type: 'string' }, r: { type: 'number' }, s: { type: 'array', items: { type: 'string' } } }, required: ['q'], additionalProperties: false }, 'first tool with a long description that wraps into the binding'),
     ];

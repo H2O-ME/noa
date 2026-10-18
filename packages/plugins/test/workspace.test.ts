@@ -43,7 +43,7 @@ describe('switch_workspace', () => {
     expect(seen).toHaveLength(2);
   });
 
-  it('is gated as execute-class (approval in read-only/auto-edit)', async () => {
+  it('is gated as execute-class (always reviewed in auto)', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'noa-ws-'));
     const host = await hostAt(root, async () => undefined);
     const entry = host.toolEntries.find((e) => e.tool.name === 'switch_workspace')!;

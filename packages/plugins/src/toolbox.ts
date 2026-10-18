@@ -45,7 +45,7 @@ export const toolboxPlugin: Plugin = {
           return await entry.tool.permissionFor(args);
         } catch {
           // Fail closed: a broken classifier must not fall back to the static
-          // kind (often `read`), which would auto-allow under read-only.
+          // kind (often `read`), which would auto-allow in `auto`.
           return 'execute';
         }
       },

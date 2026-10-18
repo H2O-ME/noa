@@ -14,11 +14,41 @@ import {
   type AgentSession,
   type ApprovalAudit,
   type ApprovalMode,
+  type AskFn,
   type ToolCall,
   type ToolCallView,
   type ToolDefinition,
 } from '@noa/core';
 import { PermissionService, type ApprovalPolicyCell } from './permission.js';
+import type { CallReviewer } from './reviewer.js';
+
+/**
+ * Compose the reviewer in FRONT of the human answerer.
+ *
+ * The permission engine only reaches its asker when the tier did NOT auto-allow
+ * the call — in `auto` that is execute / read-external / network. The reviewer
+ * classifies those; the human is consulted only for `ASK` (and for any failure of
+ * the review itself, which is the fail-closed direction: a broken reviewer must
+ * never read as consent). `ALLOW` runs the call with no interruption, `DENY`
+ * refuses it with a reason the model will read.
+ * @param reviewer - the reviewer model.
+ * @param human - the existing answerer (publishes an approval card and waits).
+ * @param rootDir - live workspace root, for the reviewer's context.
+ * @returns the composed asker.
+ */
+function reviewFirst(reviewer: CallReviewer, human: AskFn, rootDir: () => string): AskFn {
+  return async (call, kind) => {
+    let verdict;
+    try {
+      verdict = await reviewer.review({ call, kind, rootDir: rootDir() });
+    } catch {
+      return await human(call, kind);
+    }
+    if (verdict.decision === 'allow') return 'allow';
+    if (verdict.decision === 'deny') return { answer: 'deny', reason: verdict.reason };
+    return await human(call, kind);
+  };
+}
 
 /**
  * The ask wiring for ONE session.
@@ -28,8 +58,8 @@ import { PermissionService, type ApprovalPolicyCell } from './permission.js';
  * handle, and a switch leaves the previous run going). A kernel-wide engine made
  * three conversational facts global:
  *
- *  - the TIER (`read-only` / `auto-edit` / `full`): a chat peer raising its own
- *    tier raised everyone's, up to and including the desktop's;
+ *  - the TIER (`auto` / `full`): a chat peer raising its own tier raised
+ *    everyone's, up to and including the desktop's;
  *  - the REMEMBERED "always allow" grants: approving `git status` in one
  *    conversation silently approved it in every other;
  *  - the ASK's publish slot: `ApprovalBroker.attach` holds ONE publisher, so
@@ -46,6 +76,11 @@ export function makeSessionAskWiring(p: {
   tools: () => readonly ToolDefinition[];
   policyCell: ApprovalPolicyCell;
   audit: (entry: ApprovalAudit) => void;
+  /**
+   * The smart-approval reviewer, when the assembly has one. Absent = the old
+   * behaviour (every non-auto-allowed call goes straight to the human).
+   */
+  reviewer?: CallReviewer;
 }): { bridge: ApprovalBroker; questions: QuestionBroker; permission: PermissionService } {
   const findTool = (call: ToolCall): ToolDefinition | undefined =>
     p.tools().find((tool) => tool.name === call.name);
@@ -64,7 +99,8 @@ export function makeSessionAskWiring(p: {
       }
     },
   );
-  const permission = new PermissionService(p.approval, bridge.asker, p.audit, p.policyCell);
+  const asker = p.reviewer === undefined ? bridge.asker : reviewFirst(p.reviewer, bridge.asker, p.rootDir);
+  const permission = new PermissionService(p.approval, asker, p.audit, p.policyCell);
   return { bridge, questions: new QuestionBroker(), permission };
 }
 
@@ -83,6 +119,7 @@ export function makeKernelAskWiring(p: {
   tools: () => readonly ToolDefinition[];
   policyCell: ApprovalPolicyCell;
   audit: (entry: ApprovalAudit) => void;
+  reviewer?: CallReviewer;
 }): { bridge: ApprovalBroker; questions: QuestionBroker; permission: PermissionService } {
   return makeSessionAskWiring(p);
 }

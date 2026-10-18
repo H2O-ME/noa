@@ -20,7 +20,7 @@
     "@noa/core": "workspace:*"
   },
   "optionalDependencies": {
-    "@noa/plugin-context": "workspace:*",
+    "@noa/plugin-memory": "workspace:*",
     "@noa/plugin-ptc": "workspace:*",
     "@noa/plugin-subagent": "workspace:*"
   },

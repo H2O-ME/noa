@@ -44,5 +44,5 @@ export async function createAgentKernel(opts: CreateKernelOptions): Promise<Kern
   await env.openCurrent(
     opts.resumeFile !== undefined ? { resumeFile: opts.resumeFile } : { sessionDir: opts.sessionDir },
   );
-  return facade(env, opts.modelCatalog);
+  return facade(env);
 }

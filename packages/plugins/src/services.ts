@@ -14,7 +14,6 @@ import {
   compaction as compactionKey,
   jobs as jobsKey,
   llm as llmKey,
-  routes as routesKey,
   sessions as sessionsKey,
   skills as skillsKey,
   spill as spillKey,
@@ -31,7 +30,6 @@ import {
   type JobRegistry,
   type Plugin,
   type PluginManifest,
-  type RouteRegistry,
   type SkillInfo,
   type SurfaceRegistry,
 } from '@noa/core';
@@ -280,25 +278,6 @@ export function surfaceRegistryProvider(registry: SurfaceRegistry): Plugin {
     manifest: coreManifest('界面注册表', '人类端界面的注册表，决定这次调用由哪个界面服务。'),
     apply: (ctx: Context): void => {
       ctx.provide(surfacesKey, registry);
-    },
-  };
-}
-
-/**
- * The HTTP route registry as a container service. Built by the HOST that owns
- * an HTTP server (the WebUI today), provided here so a plugin can register
- * routes from its own `apply(ctx)` like any other capability — `ctx.must(routes)`
- * returns the same instance the host's request handler reads. Headless surfaces
- * (exec / qqbot today) do not provide it; a plugin that ships UI capabilities
- * reads the registry lazily and degrades when it is absent.
- */
-export function routeRegistryProvider(registry: RouteRegistry): Plugin {
-  return {
-    name: 'routes',
-    description: 'The HTTP route registry a UI-carrying host provides.',
-    manifest: coreManifest('资产路由', '插件注册自己的资产前缀；无 HTTP 宿主的形态不提供。'),
-    apply: (ctx: Context): void => {
-      ctx.provide(routesKey, registry);
     },
   };
 }

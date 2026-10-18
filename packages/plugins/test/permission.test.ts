@@ -9,9 +9,8 @@ const call = (name: string, args: Record<string, unknown> = {}): ToolCall => ({
   rawArgs: JSON.stringify(args),
 });
 
-const WRITE: PermissionKind = 'write';
 const EXECUTE: PermissionKind = 'execute';
-const NETWORK: PermissionKind = 'network';
+const READ_EXTERNAL: PermissionKind = 'read-external';
 
 /** Asker that records every dispatch and answers from a fixed script. */
 function scriptedAsk(answers: AskResult[]): { ask: AskFn; asked: ToolCall[] } {
@@ -26,16 +25,14 @@ function scriptedAsk(answers: AskResult[]): { ask: AskFn; asked: ToolCall[] } {
 
 describe('PermissionService auto-allow matrix', () => {
   it.each([
-    ['read-only', 'read', 'allow'],
-    ['read-only', 'write', 'ask'],
-    ['read-only', 'execute', 'ask'],
-    ['read-only', 'network', 'ask'],
-    ['read-only', 'read-external', 'ask'],
-    ['auto-edit', 'read', 'allow'],
-    ['auto-edit', 'write', 'allow'],
-    ['auto-edit', 'execute', 'ask'],
-    ['auto-edit', 'network', 'ask'],
-    ['auto-edit', 'read-external', 'ask'],
+    ['auto', 'read', 'allow'],
+    ['auto', 'write', 'allow'],
+    // 联网读不过闸：抓一个 URL 改不了这台机器上的任何东西，而 Hermes 的审批根本不覆盖
+    // 联网工具（它只管 bash 与文件写入）。这条曾经是 'ask'，代价是每次查资料都停住等一张
+    // 卡 —— 对无人值守的手机端是最糟的失败模式。见 `permission.ts` 的 `autoAllows`。
+    ['auto', 'network', 'allow'],
+    ['auto', 'execute', 'ask'],
+    ['auto', 'read-external', 'ask'],
     ['full', 'read', 'allow'],
     ['full', 'write', 'allow'],
     ['full', 'execute', 'allow'],
@@ -58,26 +55,27 @@ describe('PermissionService auto-allow matrix', () => {
   it('auto-allowed calls never dispatch the asker nor write audit entries', async () => {
     const audit = vi.fn();
     const { ask, asked } = scriptedAsk(['allow']);
-    const svc = new PermissionService('read-only', ask, audit);
+    const svc = new PermissionService('auto', ask, audit);
     await svc.decide('read_file', 'read', call('read_file'));
     expect(asked).toHaveLength(0);
     expect(audit).not.toHaveBeenCalled();
   });
 
-  it('setMode switches the gate at runtime (/approvals semantics)', async () => {
+  it('setMode switches the gate at runtime (/perm semantics)', async () => {
     const { ask } = scriptedAsk(['allow']);
-    const svc = new PermissionService('read-only', ask);
-    await expect(svc.decide('write_file', WRITE, call('write_file'))).resolves.toBe('allow'); // asked, allowed
-    svc.setMode('auto-edit');
-    await expect(svc.decide('write_file', WRITE, call('write_file'))).resolves.toBe('allow'); // auto-allowed now
-    expect(svc.approvalMode).toBe('auto-edit');
+    const svc = new PermissionService('auto', ask);
+    // `auto`: an execute call is gated — the asker is consulted and its allow adopted.
+    await expect(svc.decide('bash', EXECUTE, call('bash'))).resolves.toBe('allow');
+    svc.setMode('full');
+    await expect(svc.decide('bash', EXECUTE, call('bash'))).resolves.toBe('allow'); // auto-allowed now
+    expect(svc.approvalMode).toBe('full');
   });
 });
 
 describe('PermissionService fail-closed branches', () => {
   it("denies when the asker returns an invalid answer (not allow/deny/always)", async () => {
     const ask: AskFn = async () => 'maybe' as unknown as AskAnswer;
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     await expect(svc.decide('bash', EXECUTE, call('bash'))).resolves.toBe('deny');
   });
 
@@ -85,13 +83,13 @@ describe('PermissionService fail-closed branches', () => {
     const ask: AskFn = async () => {
       throw new Error('asker died');
     };
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     await expect(svc.decide('bash', EXECUTE, call('bash'))).resolves.toBe('deny');
   });
 
   it("'never' policy denies deterministically without dispatching any asker", async () => {
     const { ask, asked } = scriptedAsk(['allow']); // asker WOULD allow — must never run
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     svc.setPolicy('never');
     expect(svc.approvalPolicy).toBe('never');
     await expect(svc.decide('bash', EXECUTE, call('bash'))).resolves.toBe('deny');
@@ -100,12 +98,14 @@ describe('PermissionService fail-closed branches', () => {
 
   it("a later-registered 'never' policy still short-circuits pending asks", async () => {
     const { ask, asked } = scriptedAsk(['allow']);
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     // First ask goes through the asker (policy is still 'ask').
     await svc.decide('bash', EXECUTE, call('bash'));
     expect(asked).toHaveLength(1);
     svc.setPolicy('never');
-    await expect(svc.decide('bash', NETWORK, call('bash'))).resolves.toBe('deny');
+    // `read-external`（不是 `network`）当这个「仍被拦的种类」：联网读现在自动放行，见
+    // auto-allow 矩阵那条注释。
+    await expect(svc.decide('bash', READ_EXTERNAL, call('bash'))).resolves.toBe('deny');
     expect(asked).toHaveLength(1); // unchanged — no second dispatch
   });
 });
@@ -113,7 +113,7 @@ describe('PermissionService fail-closed branches', () => {
 describe('PermissionService always-memory scopes', () => {
   it("execute 'always' remembers the program prefix: git status grants git log but not rm", async () => {
     const { ask, asked } = scriptedAsk(['always', 'deny']);
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     await expect(svc.decide('bash', EXECUTE, call('bash', { command: 'git status -sb' }))).resolves.toBe('allow');
     await expect(svc.decide('bash', EXECUTE, call('bash', { command: 'git log --oneline' }))).resolves.toBe('allow');
     await expect(svc.check('bash', EXECUTE, call('bash', { command: 'git log' }))).resolves.toBe('allow');
@@ -124,7 +124,7 @@ describe('PermissionService always-memory scopes', () => {
 
   it('an env-assignment prefix is not the granted program: NOVA=1 git status does not grant NOVA=1 rm', async () => {
     const { ask, asked } = scriptedAsk(['always', 'deny']);
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     await expect(svc.decide('bash', EXECUTE, call('bash', { command: 'NOVA=1 git status' }))).resolves.toBe('allow');
     // Same program under a different assignment value: still covered by the grant.
     await expect(svc.check('bash', EXECUTE, call('bash', { command: 'NOVA=2 git log' }))).resolves.toBe('allow');
@@ -135,7 +135,7 @@ describe('PermissionService always-memory scopes', () => {
 
   it('compound commands are remembered as the whole normalized chain, not their head program', async () => {
     const { ask } = scriptedAsk(['always']);
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     await expect(
       svc.decide('bash', EXECUTE, call('bash', { command: 'cd x && rm -rf .' })),
     ).resolves.toBe('allow');
@@ -145,7 +145,7 @@ describe('PermissionService always-memory scopes', () => {
     ).resolves.toBe('allow');
     // `cd` alone must NOT have been granted by the chain's head program.
     const { ask: fresh, asked } = scriptedAsk(['deny']);
-    const svc2 = new PermissionService('read-only', fresh);
+    const svc2 = new PermissionService('auto', fresh);
     await expect(svc2.decide('bash', EXECUTE, call('bash', { command: 'cd y' }))).resolves.toBe('deny');
     expect(asked).toHaveLength(1); // it asked — the prefix grant did not leak
   });
@@ -154,7 +154,7 @@ describe('PermissionService always-memory scopes', () => {
     // Multi-line: bash runs lines sequentially — remembering the head `echo`
     // would let `echo hi\nrm -rf …` grant a bare `echo` forever.
     const { ask } = scriptedAsk(['always']);
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     await expect(svc.decide('bash', EXECUTE, call('bash', { command: 'echo hi\nrm -rf /tmp/x' }))).resolves.toBe(
       'allow',
     );
@@ -168,7 +168,7 @@ describe('PermissionService always-memory scopes', () => {
     // Command substitution: the user approved a program, not an arbitrary
     // interpolated payload — `$(...)`/backtick force whole-command memory too.
     const { ask: fresh, asked } = scriptedAsk(['always', 'deny']);
-    const svc2 = new PermissionService('read-only', fresh);
+    const svc2 = new PermissionService('auto', fresh);
     await expect(svc2.decide('bash', EXECUTE, call('bash', { command: 'echo $(rm -rf /tmp/x)' }))).resolves.toBe(
       'allow',
     );
@@ -178,18 +178,19 @@ describe('PermissionService always-memory scopes', () => {
 
   it("non-execute 'always' is remembered per tool name + kind only", async () => {
     const { ask } = scriptedAsk(['always', 'deny', 'deny']);
-    const svc = new PermissionService('read-only', ask);
-    await expect(svc.decide('write_file', WRITE, call('write_file', { path: 'a' }))).resolves.toBe('allow');
-    await expect(svc.decide('write_file', WRITE, call('write_file', { path: 'b' }))).resolves.toBe('allow');
-    // Same tool, different kind: still gated.
-    await expect(svc.decide('write_file', NETWORK, call('write_file'))).resolves.toBe('deny');
+    const svc = new PermissionService('auto', ask);
+    await expect(svc.decide('read_external', READ_EXTERNAL, call('read_external', { path: 'a' }))).resolves.toBe('allow');
+    await expect(svc.decide('read_external', READ_EXTERNAL, call('read_external', { path: 'b' }))).resolves.toBe('allow');
+    // Same tool, different kind: still gated. (`execute` is the other still-gated
+    // kind — a network read is auto-allowed now.)
+    await expect(svc.decide('read_external', EXECUTE, call('read_external'))).resolves.toBe('deny');
     // Different tool, same kind: still gated.
-    await expect(svc.decide('edit_file', WRITE, call('edit_file'))).resolves.toBe('deny');
+    await expect(svc.decide('other_reader', READ_EXTERNAL, call('other_reader'))).resolves.toBe('deny');
   });
 
   it('check() reports remembered and auto-allowed calls without asking', async () => {
     const { ask, asked } = scriptedAsk(['always']);
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     await svc.decide('bash', EXECUTE, call('bash', { command: 'git status' }));
     await expect(svc.check('bash', EXECUTE, call('bash', { command: 'git diff' }))).resolves.toBe('allow');
     await expect(svc.check('bash', EXECUTE, call('bash', { command: 'curl evil' }))).resolves.toBe('ask');
@@ -200,7 +201,7 @@ describe('PermissionService always-memory scopes', () => {
 describe('PermissionService adjustable always scope (M10 组件6)', () => {
   it('a 2-word grant covers the same prefix but never a sibling subcommand', async () => {
     const { ask, asked } = scriptedAsk([{ answer: 'always', scopeWords: 2 }, 'deny']);
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     await expect(svc.decide('bash', EXECUTE, call('bash', { command: 'git status -sb' }))).resolves.toBe('allow');
     // 前 2 词命中即放行（含更多尾词）。
     await expect(svc.decide('bash', EXECUTE, call('bash', { command: 'git status --porcelain' }))).resolves.toBe('allow');
@@ -216,22 +217,22 @@ describe('PermissionService adjustable always scope (M10 组件6)', () => {
   it('out-of-range / compound / non-execute grants fall back to the default scope', async () => {
     // N 超出命令词数：回落默认（程序前缀），不抛错也不放大授权。
     const { ask } = scriptedAsk([{ answer: 'always', scopeWords: 9 }, 'allow']);
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     await expect(svc.decide('bash', EXECUTE, call('bash', { command: 'git status' }))).resolves.toBe('allow');
     await expect(svc.check('bash', EXECUTE, call('bash', { command: 'git log' }))).resolves.toBe('allow'); // exec:git 生效
 
     // 复合命令没有词前缀语义：scope grant 回落整条记忆。
     const { ask: ask2 } = scriptedAsk([{ answer: 'always', scopeWords: 2 }]);
-    const svc2 = new PermissionService('read-only', ask2);
+    const svc2 = new PermissionService('auto', ask2);
     await expect(svc2.decide('bash', EXECUTE, call('bash', { command: 'cd x && git status' }))).resolves.toBe('allow');
     await expect(svc2.check('bash', EXECUTE, call('bash', { command: 'git log' }))).resolves.toBe('ask');
     await expect(svc2.check('bash', EXECUTE, call('bash', { command: 'cd x && git   status' }))).resolves.toBe('allow');
 
     // 非 execute 的 grant：scope 无意义，回落 tool:kind。
     const { ask: ask3 } = scriptedAsk([{ answer: 'always', scopeWords: 3 }]);
-    const svc3 = new PermissionService('read-only', ask3);
-    await expect(svc3.decide('write_file', WRITE, call('write_file', { path: 'a' }))).resolves.toBe('allow');
-    await expect(svc3.decide('write_file', WRITE, call('write_file', { path: 'b' }))).resolves.toBe('allow');
+    const svc3 = new PermissionService('auto', ask3);
+    await expect(svc3.decide('read_external', READ_EXTERNAL, call('read_external', { path: 'a' }))).resolves.toBe('allow');
+    await expect(svc3.decide('read_external', READ_EXTERNAL, call('read_external', { path: 'b' }))).resolves.toBe('allow');
   });
 
   it('malformed grants deny (fail-closed), plain AskAnswer strings keep working', async () => {
@@ -245,7 +246,7 @@ describe('PermissionService adjustable always scope (M10 组件6)', () => {
     ];
     for (const raw of bad) {
       const ask: AskFn = async () => raw as AskResult;
-      const svc = new PermissionService('read-only', ask);
+      const svc = new PermissionService('auto', ask);
       await expect(svc.decide('bash', EXECUTE, call('bash', { command: 'git status' }))).resolves.toBe('deny');
     }
   });
@@ -263,7 +264,7 @@ describe('PermissionService adjustable always scope (M10 组件6)', () => {
 
 describe('PermissionService deny with reason (M10 组件7)', () => {
   it('DenyGrant carries the user-typed reason through decideDetailed', async () => {
-    const svc = new PermissionService('read-only', scriptedAsk([{ answer: 'deny', reason: ' 别碰 CI ' }]).ask);
+    const svc = new PermissionService('auto', scriptedAsk([{ answer: 'deny', reason: ' 别碰 CI ' }]).ask);
     await expect(svc.decideDetailed('bash', EXECUTE, call('bash', { command: 'rm x' }))).resolves.toEqual({
       decision: 'deny',
       reason: '别碰 CI',
@@ -271,24 +272,24 @@ describe('PermissionService deny with reason (M10 组件7)', () => {
   });
 
   it('plain deny / blank or non-string reasons deny without a reason', async () => {
-    const plain = new PermissionService('read-only', scriptedAsk(['deny']).ask);
+    const plain = new PermissionService('auto', scriptedAsk(['deny']).ask);
     await expect(plain.decideDetailed('bash', EXECUTE, call('bash'))).resolves.toEqual({ decision: 'deny' });
-    const blank = new PermissionService('read-only', scriptedAsk([{ answer: 'deny', reason: '   ' }]).ask);
+    const blank = new PermissionService('auto', scriptedAsk([{ answer: 'deny', reason: '   ' }]).ask);
     await expect(blank.decideDetailed('bash', EXECUTE, call('bash'))).resolves.toEqual({ decision: 'deny' });
     const junk = new PermissionService(
-      'read-only',
+      'auto',
       scriptedAsk([{ answer: 'deny', reason: 42 } as unknown as AskResult]).ask,
     );
     await expect(junk.decideDetailed('bash', EXECUTE, call('bash'))).resolves.toEqual({ decision: 'deny' });
   });
 
   it("decide() keeps the flat 'allow'|'deny' contract; 'never' denies reasonless; allow stays a string", async () => {
-    const svc = new PermissionService('read-only', scriptedAsk([{ answer: 'deny', reason: 'x' }]).ask);
+    const svc = new PermissionService('auto', scriptedAsk([{ answer: 'deny', reason: 'x' }]).ask);
     await expect(svc.decide('bash', EXECUTE, call('bash'))).resolves.toBe('deny');
-    const never = new PermissionService('read-only', scriptedAsk([{ answer: 'deny', reason: 'x' }]).ask);
+    const never = new PermissionService('auto', scriptedAsk([{ answer: 'deny', reason: 'x' }]).ask);
     never.setPolicy('never');
     await expect(never.decideDetailed('bash', EXECUTE, call('bash'))).resolves.toEqual({ decision: 'deny' });
-    const ok = new PermissionService('read-only', scriptedAsk(['allow']).ask);
+    const ok = new PermissionService('auto', scriptedAsk(['allow']).ask);
     await expect(ok.decideDetailed('bash', EXECUTE, call('bash'))).resolves.toBe('allow');
   });
 });
@@ -310,7 +311,7 @@ describe('PermissionService ask serialization', () => {
       secondStarted = true;
       return 'deny';
     };
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     const first = svc.decide('bash', EXECUTE, { id: 'call_a', name: 'bash', args: { command: 'git status' }, rawArgs: '{"command":"git status"}' });
     const second = svc.decide('bash', EXECUTE, { id: 'call_b', name: 'bash', args: { command: 'rm -rf x' }, rawArgs: '{"command":"rm -rf x"}' });
 
@@ -330,7 +331,7 @@ describe('PermissionService ask serialization', () => {
       if (throwing) throw new Error('modal torn down');
       return 'allow';
     };
-    const svc = new PermissionService('read-only', ask);
+    const svc = new PermissionService('auto', ask);
     await expect(svc.decide('bash', EXECUTE, call('bash'))).resolves.toBe('deny'); // fail-closed
     throwing = false;
     // The chain swallowed the failure: the next ask-path decide dispatches.
@@ -344,13 +345,13 @@ describe('PermissionService audit', () => {
     const throwing: AskFn = async () => {
       throw new Error('boom');
     };
-    const svc = new PermissionService('read-only', throwing, audit);
+    const svc = new PermissionService('auto', throwing, audit);
     await svc.decide('bash', EXECUTE, call('bash', { command: 'ls' }));
     expect(audit).toHaveBeenCalledWith({ toolName: 'bash', kind: EXECUTE, outcome: 'deny' });
 
     const { ask } = scriptedAsk(['always']);
-    const svc2 = new PermissionService('read-only', ask, audit);
-    await svc2.decide('write_file', WRITE, call('write_file'));
-    expect(audit).toHaveBeenCalledWith({ toolName: 'write_file', kind: WRITE, outcome: 'always' });
+    const svc2 = new PermissionService('auto', ask, audit);
+    await svc2.decide('read_external', READ_EXTERNAL, call('read_external'));
+    expect(audit).toHaveBeenCalledWith({ toolName: 'read_external', kind: READ_EXTERNAL, outcome: 'always' });
   });
 });
