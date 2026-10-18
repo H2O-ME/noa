@@ -36,7 +36,7 @@ class FakeSocket implements GatewaySocket {
  * sink here would pass while the shipped one refused.
  */
 function makeChannel(
-  brain: (text: string, peer: { peerId: string }) => Promise<string>,
+  brain: (turn: { text: string }, peer: { peerId: string }) => Promise<string>,
   sends: Array<{ url: string; body: Record<string, unknown> }>,
 ): { channel: ReturnType<typeof createQqBotChannel>; socket: FakeSocket } {
   const socket = new FakeSocket();
@@ -76,7 +76,7 @@ const HELLO = { op: 10, d: { heartbeat_interval: 45_000 } };
 describe('createQqBotChannel', () => {
   it('routes an inbound group message through the brain and replies passively', async () => {
     const sends: Array<{ url: string; body: Record<string, unknown> }> = [];
-    const brain = vi.fn(async (text: string) => `echo:${text}`);
+    const brain = vi.fn(async (turn: { text: string }) => `echo:${turn.text}`);
     const { channel, socket } = makeChannel(brain, sends);
     await channel.start();
     socket.emit(HELLO);
@@ -89,7 +89,7 @@ describe('createQqBotChannel', () => {
     });
     await new Promise((r) => setTimeout(r, 10));
 
-    expect(brain).toHaveBeenCalledWith('帮我查天气', { kind: 'group', openid: 'G1', peerId: 'group:G1', actorId: 'MEM' });
+    expect(brain).toHaveBeenCalledWith({ text: '帮我查天气' }, { kind: 'group', openid: 'G1', peerId: 'group:G1', actorId: 'MEM' });
     expect(sends).toHaveLength(1);
     expect(sends[0]!.url).toContain('/v2/groups/G1/messages');
     expect(sends[0]!.body['msg_id']).toBe('IN1');

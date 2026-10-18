@@ -7,7 +7,7 @@
  *     robot's own mention INTO `content` — so the line began with `<`, no parser
  *     recognized it, and the command was sent to the model as prose. That is why
  *     slash commands worked in DMs and not in groups.
- *  2. `/compact`, `/goal`, `/mode` and every third-party command were not in this
+ *  2. `/compact`, `/goal` and every third-party command were not in this
  *     package's private whitelist, so they too became prompts. The kernel's live
  *     catalog decides now.
  */
@@ -16,7 +16,6 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { AgentMessage, AgentSession, ApprovalMode, KernelEvent, SessionService } from '@noa/core';
-import type { AccessTier } from '../src/access.js';
 import { BindingsStore } from '../src/bindings.js';
 import { PeerTurns, type RemoteCommandSeat } from '../src/peers.js';
 import { parseRemoteCommand, remoteBypassesQueue } from '../src/remote-parse.js';
@@ -93,7 +92,7 @@ describe('slashes the kernel owns', () => {
   it('runs a live catalog command with its verbatim argument', async () => {
     const commands = seat(['goal']);
     const turns = await turnsWith(commands);
-    expect(await turns.run('/goal 修好登录', PEER)).toEqual({ text: 'ran goal 修好登录' });
+    expect(await turns.run({ text: '/goal 修好登录' }, PEER)).toEqual({ text: 'ran goal 修好登录' });
     expect(commands.calls).toEqual([{ name: 'goal', args: '修好登录' }]);
   });
 
@@ -101,7 +100,7 @@ describe('slashes the kernel owns', () => {
     // Not in the catalog ⇒ a PROMPT: never swallowed, and never answered with a
     // fabricated "unknown command".
     const turns = await turnsWith(seat([]));
-    await expect(turns.run('/compact', PEER)).rejects.toThrow('reached the prompt path');
+    await expect(turns.run({ text: '/compact' }, PEER)).rejects.toThrow('reached the prompt path');
   });
 
   it('checks a QQ verb before the catalog', () => {
@@ -141,9 +140,9 @@ function userMessage(content: string): AgentMessage {
 /**
  * A minimal session stand-in.
  *
- * The tier is what the ceiling tests read; `messages` / `session.events` are here
- * because the relay listing reads those too (a chooser row is built from the
- * session's own workspace marker and its opening prompt).
+ * `messages` / `session.events` are here because the relay listing reads them (a
+ * chooser row is built from the session's own workspace marker and its opening
+ * prompt).
  */
 function fakeAgent(id: string, mode: ApprovalMode, messages: AgentMessage[] = []): AgentSession {
   const agent = {
@@ -164,10 +163,9 @@ function fakeAgent(id: string, mode: ApprovalMode, messages: AgentMessage[] = []
   return agent as unknown as AgentSession;
 }
 
-function tierTurns(opts: {
+function turnsWithSessions(opts: {
   list: () => AgentSession[];
   open: () => AgentSession;
-  maxTier: AccessTier;
 }): Promise<PeerTurns> {
   return mkdtemp(path.join(tmpdir(), 'nova-qqbot-tier-')).then((dir) =>
     new PeerTurns({
@@ -183,27 +181,12 @@ function tierTurns(opts: {
       bindings: new BindingsStore(path.join(dir, 'bindings.json')),
       rootDir: () => 'D:/work',
       model: () => 'm1',
-      maxTier: () => opts.maxTier,
       notify: () => undefined,
     }),
   );
 }
 
-describe('the remote tier ceiling', () => {
-  it('caps the tier of a conversation the peer OWNS, at creation', async () => {
-    // The process default is `full`; the channel ceiling is `read-only`. Without
-    // the cap the peer's own conversation runs at `full` while `/perm` reports the
-    // ceiling — the ceiling governed the verb, not the execution.
-    const created: AgentSession[] = [];
-    const turns = await tierTurns({
-      list: () => [],
-      open: () => { const agent = fakeAgent(`s${created.length + 1}`, 'full'); created.push(agent); return agent; },
-      maxTier: 'read-only',
-    });
-    await turns.run('/status', PEER);
-    expect(created[0]?.approvalMode).toBe('read-only');
-  });
-
+describe('the session listing and relay', () => {
   it('lists conversations by what they are about, with handles that differ', async () => {
     // The listing used to print `sess_c · agent` and `sess_1 · agent`: handles
     // differing by ONE character (the `sess_` prefix ate five of the six) over a
@@ -212,12 +195,11 @@ describe('the remote tier ceiling', () => {
     // in practice — the reader could not pick the desktop's conversation out.
     const desktop = fakeAgent('sess_a1b2c3d4e5f6', 'full', [userMessage('重构 qqbot 通道')]);
     const other = fakeAgent('sess_9f8e7d6c5b4a', 'full', [userMessage('今天天气怎么样')]);
-    const turns = await tierTurns({
+    const turns = await turnsWithSessions({
       list: () => [desktop, other],
       open: () => fakeAgent('sess_111122223333', 'full'),
-      maxTier: 'full',
     });
-    const reply = (await turns.run('/sessions', PEER)).text;
+    const reply = (await turns.run({ text: '/sessions' }, PEER)).text;
     // The handle is the entropy after the prefix, not the constant prefix itself.
     expect(reply).toContain('a1b2c3');
     expect(reply).toContain('9f8e7d');
@@ -227,20 +209,18 @@ describe('the remote tier ceiling', () => {
     expect(reply).toContain('今天天气怎么样');
   });
 
-  it('never lowers a RELAYED desktop session to the remote ceiling', async () => {
+  it('does not touch the tier of a RELAYED desktop session', async () => {
     // A real conversation: a session nobody has said anything in is not offered
     // as a relay target, so a fixture without a prompt would test the refusal
-    // instead of the tier rule.
+    // instead of the relay rule.
     const desktop = fakeAgent('desktop-1', 'full', [userMessage('桌面上的那段对话')]);
-    const turns = await tierTurns({
+    const turns = await turnsWithSessions({
       list: () => [desktop],
       open: () => fakeAgent('own-1', 'full'),
-      maxTier: 'read-only',
     });
-    const reply = (await turns.run(`/use ${desktop.session.id.slice(0, 6)}`, PEER)).text;
+    const reply = (await turns.run({ text: `/use ${desktop.session.id.slice(0, 6)}` }, PEER)).text;
     expect(reply).toContain('接到');
-    // The phone pointed at the desktop; it did not hand it a new tier. Lowering it
-    // here would let the remote ceiling contaminate the operator's own session.
+    // The phone pointed at the desktop; it did not hand it a new tier.
     expect(desktop.approvalMode).toBe('full');
   });
 });
@@ -249,7 +229,7 @@ describe('the remote tier ceiling', () => {
 function scriptedAgent(id: string, replyText: string): AgentSession {
   const listeners = new Set<(event: KernelEvent) => void>();
   const agent = {
-    ...fakeAgent(id, 'read-only'),
+    ...fakeAgent(id, 'auto'),
     subscribe: (listener: (event: KernelEvent) => void) => {
       listeners.add(listener);
       return () => { listeners.delete(listener); };
@@ -269,7 +249,53 @@ describe('the answer is delivered on the reply budget', () => {
     // The caller delivers the return value through the channel's reply seat, which
     // spends the reply class (the reserve narration leaves). Relaying it here as
     // narration put the answer on the DROPPABLE budget.
-    const turns = await tierTurns({ list: () => [], open: () => scriptedAgent('s1', '结论正文'), maxTier: 'read-only' });
-    expect(await turns.run('你好', PEER)).toEqual({ text: '结论正文', rich: { markdown: '结论正文' } });
+    const turns = await turnsWithSessions({ list: () => [], open: () => scriptedAgent('s1', '结论正文') });
+    expect(await turns.run({ text: '你好' }, PEER)).toEqual({ text: '结论正文', rich: { markdown: '结论正文' } });
+  });
+});
+
+describe('/retry', () => {
+  it('re-runs the dropped turn through the prompt door, not through the command doors', async () => {
+    // `/retry` describes the cut and what to say again; the RUN has to go through
+    // the same door as any other prompt, or a retried turn could behave
+    // differently from the turn it replaces.
+    const rewound: number[] = [];
+    const prompted: string[] = [];
+    const listeners = new Set<(event: KernelEvent) => void>();
+    const agent = {
+      ...fakeAgent('retry-1', 'auto'),
+      subscribe: (listener: (event: KernelEvent) => void) => {
+        listeners.add(listener);
+        return () => { listeners.delete(listener); };
+      },
+      rewindTurns: async (turns: number) => {
+        rewound.push(turns);
+        return { keepIds: [], dropped: 1, prompt: { id: 'u1', ts: 0, role: 'user', content: '重发这句' } };
+      },
+      prompt: async (text: string) => {
+        prompted.push(text);
+        for (const listener of listeners) {
+          listener({ type: 'message', message: { id: 'm9', ts: 0, role: 'assistant', content: `答复：${text}` } } as KernelEvent);
+          listener({ type: 'phase', phase: 'idle' } as KernelEvent);
+        }
+      },
+    } as unknown as AgentSession;
+    const turns = await turnsWithSessions({ list: () => [], open: () => agent });
+
+    const answer = await turns.run({ text: '/retry' }, PEER);
+    expect(rewound).toEqual([1]);
+    expect(prompted).toEqual(['重发这句']);
+    // ONE outbound message: the answer replaces the acknowledgement, so the reply
+    // reserve is not spent on saying "on it".
+    expect(answer).toEqual({ text: '答复：重发这句', rich: { markdown: '答复：重发这句' } });
+  });
+
+  it('answers with the kernel\'s refusal when the cut cannot happen', async () => {
+    const agent = {
+      ...fakeAgent('retry-2', 'auto'),
+      rewindTurns: async () => undefined,
+    } as unknown as AgentSession;
+    const turns = await turnsWithSessions({ list: () => [], open: () => agent });
+    expect((await turns.run({ text: '/retry' }, PEER)).text).toContain('没有可以重做的轮次');
   });
 });

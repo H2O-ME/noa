@@ -251,6 +251,108 @@ describe('QqGateway lifecycle', () => {
     // like a successful reconnect that had no connection behind it.
     expect(gateway.currentState).toBe('closed');
   });
+
+  it('backs off and names the cause after repeated quick disconnects', async () => {
+    // A connection that opens and dies immediately never did any work: it is a
+    // symptom (bad credentials, missing permissions), not a transient. Retrying it
+    // at 1s forever buries the real reason in a flood of identical log lines.
+    const logs: string[] = [];
+    const first = new FakeSocket();
+    const second = new FakeSocket();
+    const third = new FakeSocket();
+    const sockets = [first, second, third];
+    const gateway = new QqGateway({
+      appId: 'app',
+      token: token(),
+      resolveGatewayUrl: async () => 'wss://gateway.test',
+      socketFactory: async () => sockets.shift() as FakeSocket,
+      onDispatch: () => undefined,
+      onLog: (line) => logs.push(line),
+    });
+
+    void gateway.connect();
+    await flush();
+    first.drop();
+    await flush();
+    expect(logs.some((line) => /quick disconnect \(\d+ms\) ×1/u.test(line))).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flush();
+    second.drop();
+    await flush();
+    expect(logs.some((line) => /×2/u.test(line))).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await flush();
+    third.drop();
+    await flush();
+
+    // The third quick disconnect raises the floor and says what to check.
+    expect(logs.some((line) => line.includes('AppID / AppSecret'))).toBe(true);
+    expect(logs.some((line) => line.includes('reconnecting in 30000ms'))).toBe(true);
+    gateway.close();
+  });
+
+  it('retries a failed FIRST dial instead of handing the failure back', async () => {
+    // The first dial of a resident channel has no caller to report to: nobody is
+    // going to type the command again. A transient DNS/TLS failure there used to
+    // leave a process that had printed its banner and then exited, so the operator
+    // saw a clean exit and no bot. It must join the reconnect path instead.
+    const logs: string[] = [];
+    const socket = new FakeSocket();
+    let lookups = 0;
+    const gateway = new QqGateway({
+      appId: 'app',
+      token: token(),
+      resolveGatewayUrl: async () => {
+        lookups += 1;
+        if (lookups === 1) throw new TypeError('fetch failed');
+        return 'wss://gateway.test';
+      },
+      socketFactory: async () => socket,
+      onDispatch: () => undefined,
+      onLog: (line) => logs.push(line),
+    });
+
+    await expect(gateway.begin()).resolves.toBeUndefined();
+    expect(logs.some((line) => line.includes('connect failed: fetch failed'))).toBe(true);
+    expect(gateway.currentState).toBe('reconnecting');
+
+    // The backoff timer is what keeps a resident process alive through the retry.
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flush();
+    socket.emit(HELLO);
+    await flush();
+    socket.emit(READY);
+    expect(gateway.currentState).toBe('ready');
+    gateway.close();
+  });
+
+  it('ends the retry chain when close() lands during a failed first dial', async () => {
+    // The gateway is terminal, so a retry armed by a failure must not outlive it —
+    // otherwise a switched-off channel keeps dialing in the background.
+    let lookups = 0;
+    const gateway = new QqGateway({
+      appId: 'app',
+      token: token(),
+      resolveGatewayUrl: async () => {
+        lookups += 1;
+        throw new TypeError('fetch failed');
+      },
+      socketFactory: async () => new FakeSocket(),
+      onDispatch: () => undefined,
+      onLog: () => undefined,
+    });
+
+    await gateway.begin();
+    expect(lookups).toBe(1);
+    gateway.close();
+
+    await vi.advanceTimersByTimeAsync(120_000);
+    await flush();
+    expect(lookups).toBe(1);
+    expect(gateway.currentState).toBe('closed');
+  });
 });
 
 describe('InboundHandler shutdown', () => {
@@ -270,9 +372,9 @@ describe('InboundHandler shutdown', () => {
       reply: (_peerId, content) => { replies.push(content); return Promise.resolve({ ok: true }); },
     };
     const handler = new InboundHandler({
-      brain: (text) => {
-        brainCalls.push(text);
-        return text === 'park' ? gate.then(() => 'parked-done') : Promise.resolve(`echo:${text}`);
+      brain: (turn) => {
+        brainCalls.push(turn.text);
+        return turn.text === 'park' ? gate.then(() => 'parked-done') : Promise.resolve(`echo:${turn.text}`);
       },
       reply,
       log: () => undefined,
@@ -405,6 +507,47 @@ describe('QqBotChannel lifecycle', () => {
     // The old `start()` set `started = true` and returned silently while the
     // gateway stayed disposed — a channel claiming to run with no connection.
     await expect(channel.start()).rejects.toThrow(/stopped and cannot be restarted/);
+  });
+
+  it('keeps trying after a failed FIRST dial instead of rejecting start()', async () => {
+    // The plugin's `.catch` is a backstop, not the retry path. If `start()`
+    // rejected here, a transient failure at boot would be reported as a dead
+    // channel that nothing ever re-dials.
+    vi.useFakeTimers();
+    try {
+      const socket = new FakeSocket();
+      const logs: string[] = [];
+      let lookups = 0;
+      const channel = createQqBotChannel({
+        appId: 'app',
+        clientSecret: 'secret',
+        brain: () => Promise.resolve('reply'),
+        fetchFn: async (url) => {
+          if (String(url).includes('/getAppAccessToken')) return jsonResponse(200, { access_token: 't', expires_in: 7200 });
+          if (String(url).includes('/gateway/bot')) {
+            lookups += 1;
+            if (lookups === 1) throw new TypeError('fetch failed');
+            return jsonResponse(200, { url: 'wss://gateway.test' });
+          }
+          return jsonResponse(200, { id: 'out-1' });
+        },
+        socketFactory: async () => socket,
+        log: (line) => logs.push(line),
+      });
+
+      await expect(channel.start()).resolves.toBeUndefined();
+      expect(logs.some((line) => line.includes('connect failed: fetch failed'))).toBe(true);
+      expect(channel.state).toBe('reconnecting');
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      socket.emit(HELLO);
+      await vi.advanceTimersByTimeAsync(0);
+      socket.emit(READY);
+      expect(channel.running).toBe(true);
+      channel.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('bounds a send whose response carries no message id', async () => {

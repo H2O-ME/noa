@@ -14,6 +14,13 @@ export interface HttpClientResponse {
   ok: boolean;
   status: number;
   json: () => Promise<unknown>;
+  /**
+   * The binary body, for media downloads. Optional because a JSON-only caller
+   * (a token request, a send receipt) has no use for it, and a test double need
+   * not implement it — a caller that needs bytes checks for the method and reports
+   * a refusal rather than crashing.
+   */
+  bytes?: () => Promise<Uint8Array>;
 }
 
 export type FetchLike = (

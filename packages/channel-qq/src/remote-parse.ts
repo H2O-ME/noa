@@ -12,19 +12,52 @@
  * 且**大小写敏感**（`/Perm` 是普通文本，不是指令）。
  */
 
-/** 权限档位（与内核 `ApprovalMode` 同词汇）。 */
-export type RemotePerm = 'read-only' | 'auto-edit' | 'full';
+/** 权限档位（与内核 `ApprovalMode` 同词汇：auto = 智能审批，full = 全放行）。 */
+export type RemotePerm = 'auto' | 'full';
 
 /** 一条认得出的遥控指令。 */
 export type RemoteCommand =
   | { kind: 'perm'; mode: RemotePerm }
-  | { kind: 'model'; model: string }
+  /**
+   * 切换模型。`persist` 表示**同时**把它写成这个部署的默认（`/model default <id>`）：
+   * 切换改的是这个进程的 client，写默认改的是配置文件，好让下次启动仍从那里开始 ——
+   * 两件都做了才叫「改默认模型」。
+   */
+  | { kind: 'model'; model: string; persist?: boolean }
   | { kind: 'models' }
   | { kind: 'workspace'; dir?: string }
   | { kind: 'new' }
   | { kind: 'help' }
   | { kind: 'approve'; allow: boolean }
   | { kind: 'status' }
+  /**
+   * What this conversation has spent so far: token totals, plus money when the
+   * deployment priced its models.
+   *
+   * A READ that earns a verb of its own rather than a line inside `/status`: a
+   * resident bot runs for weeks, so "what has this cost me" is a question about a
+   * number that keeps growing, and an answer buried among four other facts is one
+   * nobody asks twice.
+   */
+  | { kind: 'usage' }
+  /**
+   * Take back the last `turns` turns, so the model stops seeing them.
+   *
+   * The log keeps them (a rewind SHADOWS the surface, it does not delete) — which
+   * is what makes this safe to offer from a phone: a mis-typed `/undo 3` costs the
+   * peer three turns of context, not three turns of transcript.
+   */
+  | { kind: 'undo'; turns: number }
+  /**
+   * Say the last thing again from a clean slate: take back the last turn and
+   * re-send the prompt that opened it.
+   *
+   * A verb of its own rather than `/undo 1` plus a re-typed message because the
+   * re-typed message would be a SECOND prompt with its own text — and the whole
+   * point is to re-ask the SAME question, which is the one thing a chat window
+   * cannot easily reproduce once it has scrolled.
+   */
+  | { kind: 'retry' }
   /**
    * Session RELAY: see which conversations are alive, point this chat at one, or
    * let go of it. This is the phone-driving-a-desktop half of the channel — a
@@ -54,7 +87,7 @@ export type RemoteParse =
   | { command?: undefined; text: string };
 
 /** The permission tiers a peer may choose, in the order the help text lists them. */
-export const REMOTE_PERM_MODES: readonly RemotePerm[] = ['read-only', 'auto-edit', 'full'];
+export const REMOTE_PERM_MODES: readonly RemotePerm[] = ['auto', 'full'];
 
 /**
  * A `/name args` line, split the ONE way.
@@ -99,6 +132,7 @@ export function remoteBypassesQueue(command: RemoteCommand): boolean {
   switch (command.kind) {
     case 'approve':
     case 'status':
+    case 'usage':
     case 'help':
     case 'sessions':
     // All three are UNBLOCKING: `/stop` exists to release a run that is parked
@@ -117,6 +151,14 @@ export function remoteBypassesQueue(command: RemoteCommand): boolean {
     case 'use':
     case 'unbind':
       return false;
+    case 'undo':
+    case 'retry':
+      // The opposite of the unblocking verbs, and the reason is the same: these
+      // MUTATE the surface. An undo spliced in beside a live turn would take back
+      // a turn the running request is still building from, so it belongs in the
+      // queue — where it lands after the turn it is undoing, which is also the
+      // only order that makes sense to the peer.
+      return false;
   }
 }
 
@@ -129,6 +171,48 @@ function asPrompt(text: string): RemoteParse {
 function asCommand(command: RemoteCommand): RemoteParse {
   return { command };
 }
+
+/**
+ * `/undo` 的论元：缺省一轮，只接受正整数。
+ *
+ * Split out because it is the one verb with a numeric argument, and the rules for
+ * it are the verb's own rather than the dispatcher's: "no argument" is a default
+ * while "0 / -1 / 2.5 / 1 2" are usage mistakes that must become a PROMPT rather
+ * than a silent one — reading `/undo 0` as "undo one" would take back a turn the
+ * peer did not ask for.
+ * @param rest - the text after the verb, already trimmed.
+ * @returns the turn count, or undefined when the argument is a usage mistake.
+ */
+function undoArgument(rest: string): number | undefined {
+  if (rest.length === 0) return 1;
+  if (!/^\d+$/u.test(rest)) return undefined;
+  const turns = Number.parseInt(rest, 10);
+  return turns >= 1 ? turns : undefined;
+}
+
+/**
+ * The verbs that take no argument at all: the name IS the whole command.
+ *
+ * A table rather than one `case` per verb, because the fact these share is one
+ * fact — "an argument here is not a variant, it is noise" — and spelling it eight
+ * times hid it. It also keeps the dispatcher below proportional to the verbs that
+ * genuinely have ARGUMENTS to interpret, which is where the rules live.
+ */
+const BARE_VERBS: ReadonlyMap<string, RemoteCommand> = new Map<string, RemoteCommand>([
+  ['/new', { kind: 'new' }],
+  // Listing is a read: it changes which conversation this chat drives NOTHING, so
+  // it never needs an argument.
+  ['/sessions', { kind: 'sessions' }],
+  ['/unbind', { kind: 'unbind' }],
+  ['/stop', { kind: 'stop' }],
+  ['/status', { kind: 'status' }],
+  // A readout: "how much have I spent" has no sub-question a word here would
+  // disambiguate.
+  ['/usage', { kind: 'usage' }],
+  // "Redo the last turn" is the whole verb.
+  ['/retry', { kind: 'retry' }],
+  ['/help', { kind: 'help' }],
+]);
 
 /**
  * Parse one inbound line.
@@ -150,6 +234,8 @@ export function parseRemoteCommand(raw: string): RemoteParse {
   const slash = splitSlash(raw);
   if (slash === undefined) return asPrompt(raw);
   const { name, args: rest } = slash;
+  const bare = BARE_VERBS.get(name);
+  if (bare !== undefined) return asCommand(bare);
   switch (name) {
     case '/perm':
     case '/approvals':
@@ -158,36 +244,39 @@ export function parseRemoteCommand(raw: string): RemoteParse {
       return REMOTE_PERM_MODES.includes(rest as RemotePerm)
         ? asCommand({ kind: 'perm', mode: rest as RemotePerm })
         : asPrompt(raw);
-    case '/model':
+    case '/model': {
       // An absent id asks a question (list them) rather than being a no-op.
-      return rest.length === 0 ? asCommand({ kind: 'models' }) : asCommand({ kind: 'model', model: rest });
+      if (rest.length === 0) return asCommand({ kind: 'models' });
+      // `/model default <id>`：切换**并**写成默认。子命令而不是 `--flag`，因为聊天里
+      // 打错一个 `--` 比打错一个词更容易被忽略，而这条指令会改配置文件。
+      const [head, ...tail] = rest.split(/\s+/);
+      // 光一个 `default` 没带 id：操作者想说「改默认」但没说改成哪个。回一份可选清单
+      // （和裸 `/model` 同一个回答），比「没有名为 default 的模型」有用得多 —— 后者会
+      // 让人以为指令写对了、只是模型不存在。
+      if (head === 'default') {
+        return tail.length > 0
+          ? asCommand({ kind: 'model', model: tail.join(' '), persist: true })
+          : asCommand({ kind: 'models' });
+      }
+      return asCommand({ kind: 'model', model: rest });
+    }
     case '/ws':
       // A workspace move with no argument reports where it is; the kernel's
       // `setWorkspace` validates a real path, and guessing one here would hide
       // its refusal.
       return rest.length === 0 ? asCommand({ kind: 'status' }) : asCommand({ kind: 'workspace', dir: rest });
-    case '/new':
-      return asCommand({ kind: 'new' });
-    case '/sessions':
-      // Listing is a read: it changes which conversation this chat drives NOTHING,
-      // so it never needs an argument.
-      return asCommand({ kind: 'sessions' });
     case '/use':
       // No argument is a usage mistake, not a "list them" question: `/sessions` is
       // the listing verb, and answering a different question here would teach the
       // peer the wrong command.
       return rest.length === 0 ? asPrompt(raw) : asCommand({ kind: 'use', target: rest });
-    case '/unbind':
-      return asCommand({ kind: 'unbind' });
-    case '/stop':
-      return asCommand({ kind: 'stop' });
     case '/answer':
       // Empty is a usage mistake: an answer with nothing in it is not an answer.
       return rest.length === 0 ? asPrompt(raw) : asCommand({ kind: 'answer', text: rest });
-    case '/status':
-      return asCommand({ kind: 'status' });
-    case '/help':
-      return asCommand({ kind: 'help' });
+    case '/undo': {
+      const turns = undoArgument(rest);
+      return turns === undefined ? asPrompt(raw) : asCommand({ kind: 'undo', turns });
+    }
     case '/approve':
     case '/deny':
       return asCommand({ kind: 'approve', allow: name === '/approve' });

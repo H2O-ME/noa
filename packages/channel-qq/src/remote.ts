@@ -15,18 +15,22 @@
  * 全部依赖注入，所以每一条都能对着假实现直接驱动，不需要网络也不需要真内核。
  */
 import { errMessage } from '@noa/core';
-import type {
-  AgentSession,
-  ApprovalMode,
-  AskResult,
-  AskUserQuestionAnswer,
-  AskUserQuestionItem,
+import {
+  costOf,
+  type AgentSession,
+  type ApprovalMode,
+  type AskResult,
+  type AskUserQuestionAnswer,
+  type AskUserQuestionItem,
+  type PricingTable,
+  type TurnRewind,
+  type UsageStats,
 } from '@noa/core';
-import { clampTier, tierLabel, type AccessTier } from './access.js';
 import { labelOf, rowTitle, stampOf } from './relay-candidates.js';
 import { answerPendingQuestion } from './question-answer.js';
 import { cardText, type QqKeyboard, type RichSend } from './protocol.js';
 import type { RemoteCommand, RemotePerm } from './remote-parse.js';
+import type { TurnInput } from './types.js';
 
 /**
  * The kernel capabilities remote control needs — exactly the seats named in the
@@ -53,7 +57,31 @@ export interface RemoteKernelPort {
     current(): string;
     list(): Promise<readonly { models: readonly { id: string }[] }[]>;
     select(model: string): Promise<{ id: string }>;
+    /**
+     * Write one id down as this deployment's default (`/model default <id>`).
+     *
+     * Optional INSIDE the seat because it is a different authority: switching
+     * retargets this process, this rewrites the config the next process reads. A
+     * seat without it can still switch, and the reply says the default did not
+     * change rather than implying it did.
+     */
+    setDefault?(model: string): Promise<{ ok: boolean; reason?: string }>;
+    /** The model the config file names now, for "switch" vs "default" talk. */
+    configuredDefault?(): Promise<string | undefined>;
   };
+}
+
+/** Every id the endpoint publishes, flattened out of its groups. */
+async function seatIds(seat: NonNullable<RemoteKernelPort['models']>): Promise<string[]> {
+  const groups = await seat.list().catch(() => [] as readonly { models: readonly { id: string }[] }[]);
+  return groups.flatMap((group) => group.models.map((model) => model.id));
+}
+
+/** The "these are the ones that exist" tail of a refused switch. */
+async function optionsHint(seat: NonNullable<RemoteKernelPort['models']>): Promise<string> {
+  const ids = await seatIds(seat);
+  if (ids.length === 0) return '端点没有公布任何模型（`GET /models` 空或不可达），用 /model 再试一次。';
+  return `可选：\n${ids.map((id) => `- ${id}`).join('\n')}`;
 }
 
 /**
@@ -76,6 +104,29 @@ export interface RemoteSessionPort {
   /** The outstanding `ask_user_question` batches, for `/answer`. */
   pendingQuestions(): readonly { id: string; questions: readonly AskUserQuestionItem[] }[];
   resolveQuestion(id: string, answer: AskUserQuestionAnswer): boolean;
+  /**
+   * This conversation's cumulative usage, for `/usage`.
+   *
+   * Optional because it is a READOUT: an assembly whose sessions keep no token
+   * accounting still runs this channel perfectly well, and `/usage` then says so
+   * rather than printing zeros. "Spent nothing" and "cannot be read" are different
+   * facts, and only one of them is worth acting on.
+   */
+  usage?(): UsageStats;
+  /**
+   * Take back the last `turns` turns from this conversation's model surface
+   * (`/undo`, `/retry`).
+   *
+   * Required, unlike `usage`: this is a method on every session rather than a
+   * capability an assembly may or may not keep, so a deployment where `/undo`
+   * cannot work does not exist. Absent would only invite a branch that is dead
+   * code everywhere.
+   *
+   * Returns undefined when the surface holds no turn to drop; THROWS when a run
+   * is in flight (the kernel refuses to splice the surface under a live request),
+   * which the caller reports rather than swallows.
+   */
+  rewind(turns: number): Promise<TurnRewind | undefined>;
 }
 
 /** How long a remote approval waits before it fails closed. */
@@ -83,8 +134,7 @@ export const REMOTE_APPROVAL_TIMEOUT_MS = 3 * 60_000;
 
 /** 权限档 → 中文读数（与设置页 / REPL 同一套词汇）。 */
 const PERM_LABEL: Readonly<Record<RemotePerm, string>> = {
-  'read-only': '只读',
-  'auto-edit': '自动编辑',
+  auto: '智能审批',
   full: '全放行',
 };
 
@@ -111,9 +161,17 @@ export function remoteHelpLines(ctx: RemoteContext): string[] {
   const lines = [
     '可用遥控指令：',
     '/status — 看当前工作区 / 模型 / 权限 / 待审批',
-    '/perm read-only|auto-edit|full（/approvals 同义）— 切换权限档',
+    '/usage — 看本会话的 token 用量（配了 pricing 还给出估算成本）',
+    '/perm auto|full（/approvals 同义）— 切换权限档（auto=智能审批，full=全放行）',
   ];
-  if (kernel.models !== undefined) lines.push('/model — 列出可选模型；/model <id> — 切换');
+  if (kernel.models !== undefined) {
+    lines.push('/model — 列出可选模型；/model <id> — 切换（本进程，重启回到配置里的默认）');
+    // 只有真的能写回配置文件才宣传这条：没有那个座位时 `/model default` 只会回
+    // 「默认模型没改」，把一个做不到的动词写进帮助里，等于教对端一条没用的指令。
+    if (kernel.models.setDefault !== undefined) {
+      lines.push('/model default <id> — 切换**并**写成默认（改 config.json，下次启动仍是它）');
+    }
+  }
   lines.push('/ws — 看当前工作区');
   if (kernel.setWorkspace !== undefined) lines.push('/ws <目录> — 切换工作区');
   lines.push('/new — 为这个对话开一个新会话');
@@ -126,6 +184,8 @@ export function remoteHelpLines(ctx: RemoteContext): string[] {
   }
   lines.push(
     '/stop — 中止本对话正在跑的任务',
+    '/undo [n] — 回退最近 n 轮（缺省 1 轮），让模型不再看到它们（日志仍保留）',
+    '/retry — 回退最近一轮并重发那句话',
     '/answer <答案> — 回答 agent 的提问（也可用选项编号，如 /answer 2）',
     '/approve — 允许待审批的命令；/deny — 拒绝',
     '/help — 这份清单',
@@ -245,15 +305,15 @@ export interface RemoteContext {
   /** Session relay, when this deployment has other conversations to offer. */
   relay?: RemoteRelayPort;
   /**
-   * The strongest tier a REMOTE peer may set for its own conversation.
+   * What each model costs, when the deployment wrote a price table (USD per
+   * million tokens — see `core/pricing.ts`).
    *
-   * Enforced here rather than in the parser or the menu, because this is the
-   * operation that changes the tier: an `/perm full` arriving from a chat window
-   * must be capped by what the operator granted locally, and a check anywhere
-   * else would leave the execution path able to exceed it. Absent means the
-   * machine's own default (`read-only`) — never "unlimited".
+   * Here rather than on the kernel port because it is not a capability of the
+   * process, it is a line in the operator's config: `/usage` reads it to put a
+   * number on token counts, and its ABSENCE is reported as "unpriced" rather than
+   * as $0.00 — a figure nobody can tell apart from free.
    */
-  maxTier?: AccessTier;
+  pricing?: PricingTable;
 }
 
 /** 一句话回复 +（`/new` 时）要换绑的新会话句柄。 */
@@ -263,6 +323,18 @@ export interface RemoteOutcome {
   rich?: RichSend;
   /** Present for `/new`: the caller rebinds this peer to it. */
   nextAgent?: AgentSession;
+  /**
+   * A prompt to run through the NORMAL prompt door, whose answer replaces `reply`
+   * when present.
+   *
+   * `/retry` is the only producer, and the field exists so that the verb can be
+   * described ENTIRELY here — what to drop, and what to say again — while the run
+   * itself stays where every other prompt runs (`peers.ts`). The other split,
+   * special-casing `/retry` inside `peers.ts`, would put half the verb in the
+   * parser and half in the orchestrator, which is the drift this module's single
+   * door exists to prevent.
+   */
+  resend?: TurnInput;
 }
 
 /** `/status` 的读数。 */
@@ -277,6 +349,106 @@ function statusLines(ctx: RemoteContext): string[] {
     `权限：${label}`,
     pending > 0 ? `待审批：${pending} 条（回复 /approve 或 /deny）` : '无待审批',
   ];
+}
+
+/** 千位分隔：手写而不是 `toLocaleString`，因为读数不该随进程的 locale 变。 */
+function count(n: number): string {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/gu, ',');
+}
+
+/**
+ * 金额读数。
+ *
+ * 常驻机器人会同时遇到两种量级 —— 一次问答的零点几厘，和一个月的几块钱 —— 所以精度
+ * 跟着量级走。**绝不把非零印成 $0**：`<$0.000001` 是实话，`$0` 是「免费」，两者对
+ * 读账单的人是相反的结论。
+ */
+function usd(amount: number): string {
+  if (amount <= 0) return '$0';
+  if (amount < 0.000_001) return '<$0.000001';
+  if (amount < 0.01) return `$${amount.toFixed(6).replace(/0+$/u, '').replace(/\.$/u, '')}`;
+  return `$${amount.toFixed(4)}`;
+}
+
+/**
+ * `/usage` 的读数。
+ *
+ * Two states, and the difference is the point: a deployment that wrote no price
+ * table still gets its token totals, and the cost line then says the model is
+ * UNPRICED instead of printing `$0.00`. An unpriced model is not a free one, and a
+ * readout that cannot tell them apart is worse than no readout.
+ * @param ctx - the seats in force.
+ * @returns the lines, headed by which model they describe.
+ */
+function usageLines(ctx: RemoteContext): string[] {
+  const usage = ctx.session.usage?.();
+  if (usage === undefined) {
+    return ['这个进程读不到本会话的用量：会话没有 token 记账（换一个装配，或看内核的 metrics）。'];
+  }
+  const model = ctx.kernel.models?.current() ?? ctx.kernel.model?.() ?? '未知';
+  const lines = [
+    `轮次：${count(usage.turns)}`,
+    `输入：${count(usage.promptTokens)} token${usage.cachedTokens > 0 ? `（缓存命中 ${count(usage.cachedTokens)}）` : ''}`,
+    `输出：${count(usage.completionTokens)} token`,
+  ];
+  // Only when there IS a miss: a provider that never reports caching leaves this
+  // at zero by construction, and a permanent "未命中缓存：0" would read as a defect.
+  if (usage.missTokens > 0) {
+    lines.push(`其中未命中缓存：${count(usage.missTokens)} token（按全价计，共 ${count(usage.missTurns)} 轮）`);
+  }
+  lines.push(costLine(model, usage, ctx.pricing));
+  return [`📊 本会话用量（${model}）：`, ...lines];
+}
+
+/**
+ * The cost line: an estimate, a lower bound, or an honest "unpriced".
+ * @param model - the model in force.
+ * @param usage - the session's cumulative totals.
+ * @param pricing - the deployment's price table, when it wrote one.
+ * @returns the line.
+ */
+function costLine(model: string, usage: UsageStats, pricing: PricingTable | undefined): string {
+  const hint = `在 config.json 的 pricing 里给 ${model} 填 input/output（每百万 token 的美元价）`;
+  if (pricing === undefined) return `成本：未配价 —— ${hint}。`;
+  const estimate = costOf(model, usage, pricing);
+  if (estimate === undefined) return `成本：${model} 未配价 —— ${hint}。`;
+  const sides = [
+    estimate.inputUSD === undefined ? undefined : `输入 ${usd(estimate.inputUSD)}`,
+    estimate.outputUSD === undefined ? undefined : `输出 ${usd(estimate.outputUSD)}`,
+  ].filter((side): side is string => side !== undefined);
+  // `≥` when one side is unpriced: the sum is a floor, not the bill, and the
+  // distinction is exactly what the `partial` flag was carried out of core for.
+  const mark = estimate.partial ? '≥' : '≈';
+  const note = estimate.partial ? '；未配价的一侧未计入' : '';
+  return `成本：${mark} ${usd(estimate.totalUSD)}（${sides.join(' + ')}${note}）`;
+}
+
+/**
+ * Take back turns, phrasing the refusals a peer can actually hit.
+ *
+ * A discriminated result rather than a throw, because both callers (`/undo` and
+ * `/retry`) must ANSWER either way, and the two failure modes need different
+ * sentences: "there is nothing to take back" is a state of the conversation
+ * (reported in the caller's own verb — `/retry` is not a kind of `/undo` to
+ * whoever typed it), while the kernel's "a run is in flight" is a refusal the peer
+ * can act on (wait, or `/stop`).
+ * @param ctx - the seats in force.
+ * @param turns - how many turns to drop.
+ * @param empty - the sentence for "this conversation has no turn to drop".
+ * @returns the cut, or the sentence to send back instead.
+ */
+async function attemptRewind(
+  ctx: RemoteContext,
+  turns: number,
+  empty: string,
+): Promise<{ ok: true; plan: TurnRewind } | { ok: false; reply: string }> {
+  try {
+    const plan = await ctx.session.rewind(turns);
+    if (plan === undefined) return { ok: false, reply: empty };
+    return { ok: true, plan };
+  } catch (err) {
+    return { ok: false, reply: `回退失败：${errMessage(err)}` };
+  }
 }
 
 /**
@@ -299,8 +471,7 @@ export async function runRemoteCommand(command: RemoteCommand, ctx: RemoteContex
           { label: '新会话', kind: 'command', data: '/new' },
         ],
         [
-          { label: '只读', kind: 'command', data: '/perm read-only' },
-          { label: '自动编辑', kind: 'command', data: '/perm auto-edit' },
+          { label: '智能审批', kind: 'command', data: '/perm auto' },
           { label: '全放行', kind: 'command', data: '/perm full' },
         ],
         [
@@ -325,16 +496,36 @@ export async function runRemoteCommand(command: RemoteCommand, ctx: RemoteContex
       const lines = statusLines(ctx);
       return { reply: lines.join('\n'), rich: { markdown: cardText(lines), keyboard: { rows } } };
     }
+    case 'usage': {
+      const lines = usageLines(ctx);
+      return { reply: lines.join('\n'), rich: { markdown: cardText(lines) } };
+    }
+    case 'undo': {
+      const attempt = await attemptRewind(ctx, command.turns, '没有可以回退的轮次：这段会话里还没有用户提示词。');
+      if (!attempt.ok) return { reply: attempt.reply };
+      // Say what actually went, not what was asked for: `/undo 99` on a two-turn
+      // conversation drops two, and a reply echoing "99" would be the same class
+      // of lie as a permission switch that never landed.
+      return {
+        reply: `已回退 ${attempt.plan.dropped} 轮。这些消息仍在日志里（只是不再进模型上下文），需要的话可以 /new 开一段干净的会话。`,
+      };
+    }
+    case 'retry': {
+      const attempt = await attemptRewind(ctx, 1, '没有可以重做的轮次：这段会话里还没有用户提示词。');
+      if (!attempt.ok) return { reply: attempt.reply };
+      // No reply of its own: the answer to the re-sent prompt IS the reply, and
+      // spending one of this inbound message's outbound allowance on an
+      // acknowledgement would risk the reserve the answer needs (see `outbox.ts`).
+      const { prompt } = attempt.plan;
+      return {
+        reply: '',
+        resend: {
+          text: prompt.content,
+          ...(prompt.images === undefined ? {} : { images: prompt.images }),
+        },
+      };
+    }
     case 'perm': {
-      // The ceiling is applied to what LANDS, not to what was asked: a peer that
-      // asks for more than the operator granted is told so, instead of silently
-      // getting the smaller tier and believing it holds the bigger one.
-      const ceiling = ctx.maxTier ?? 'read-only';
-      if (clampTier(command.mode, ceiling) !== command.mode) {
-        return {
-          reply: `远端权限最高只能到「${tierLabel(ceiling)}」；要更高请在操作这台机器的那一侧打开（并提高上限）。`,
-        };
-      }
       ctx.session.setApprovalMode(command.mode);
       // Read back rather than echoing: `setApprovalMode` no-ops when a session
       // has no permission service, and claiming a switch that did not land is
@@ -345,19 +536,49 @@ export async function runRemoteCommand(command: RemoteCommand, ctx: RemoteContex
     }
     case 'model': {
       const seat = ctx.kernel.models;
-      if (seat === undefined) return { reply: '这个进程没有模型座位（端点未配置或不可切换），换模型请在设置页操作。' };
-      const option = await seat.select(command.model);
-      return { reply: `模型已切到 ${option.id}。` };
+      // 座位不在 = 本部署没有可切换的模型目录。原来这句写的是「端点未配置或不可切换，
+      // 换模型请在设置页操作」——两头都不实：端点配着、进程正在用它说话，而 Noa 根本没
+      // 有设置页。现在照实说清「默认写在哪个文件、改它要不要重启」。
+      if (seat === undefined) {
+        return { reply: `这个进程没有模型切换座位：本部署的模型写在 config.json 的 provider.model 里，改它请编辑该文件后重启。` };
+      }
+      let option: { id: string };
+      try {
+        // 端点清单是唯一权威（Hermes 的 `_validate_switch` 同一纪律）：拼错的名字在
+        // 这里被拒并把可选项列出来，而不是让上游回一个 404、让人以为端点坏了。
+        option = await seat.select(command.model);
+      } catch (err) {
+        return { reply: `模型未切换：${errMessage(err)}\n${await optionsHint(seat)}` };
+      }
+      if (command.persist !== true) {
+        return {
+          reply: `模型已切到 ${option.id}（本进程，所有对话一起变；重启后回到配置文件里的默认）。\n写成默认用 /model default ${option.id}。`,
+        };
+      }
+      const defaults = ctx.kernel.models;
+      if (defaults?.setDefault === undefined) {
+        return { reply: `模型已切到 ${option.id}，但本进程没有可写的配置文件，默认模型没改。` };
+      }
+      const written = await defaults.setDefault(option.id);
+      return {
+        reply: written.ok
+          ? `模型已切到 ${option.id}，并已写成默认（下次启动仍是它）。`
+          : `模型已切到 ${option.id}，但默认模型没写成：${written.reason ?? '未知原因'}。`,
+      };
     }
     case 'models': {
       const seat = ctx.kernel.models;
-      if (seat === undefined) return { reply: '这个进程没有模型座位（端点未配置或不可切换）。' };
-      const groups = await seat.list();
-      const ids = groups.flatMap((group) => group.models.map((model) => model.id));
-      if (ids.length === 0) return { reply: '端点没有公布任何模型；可以在设置页里手动配置 models[]。' };
+      if (seat === undefined) {
+        return { reply: `这个进程没有模型切换座位：本部署的模型写在 config.json 的 provider.model 里，改它请编辑该文件后重启。` };
+      }
+      const ids = await seatIds(seat);
+      if (ids.length === 0) {
+        return { reply: '端点没有公布任何模型（`GET /models` 空或不可达），所以没有可切的清单。' };
+      }
+      const list = ids.map((id) => `- ${id}`).join('\n');
       return {
-        reply: `可选模型：\n${ids.map((id) => `- ${id}`).join('\n')}\n用 /model <id> 切换。`,
-        rich: { markdown: `**可选模型（${ids.length}）：**\n${ids.map((id) => `- ${id}`).join('\n')}\n用 \`/model <id>\` 切换。` },
+        reply: `可选模型：\n${list}\n用 /model <id> 切换；/model default <id> 切换并写成默认。`,
+        rich: { markdown: `**可选模型（${ids.length}）：**\n${list}\n用 \`/model <id>\` 切换；\`/model default <id>\` 切换并写成默认。` },
       };
     }
     case 'workspace': {

@@ -52,13 +52,27 @@ export interface SendOptions {
 const IDENTITY_TIMEOUT_MS = 3_000;
 
 /**
+ * msg_seq 账本的保留窗口与容量上限。
+ *
+ * 一个 `msg_id` 的 seq 只需要活到它自己的被动窗口结束：窗口一过，对它再发消息本来就会
+ * 被平台拒（`msg_id` 已失效）。但**过早忘掉**是有代价的——seq 会从 1 重新开始，同一个
+ * `msg_id` 上第二次 seq=1 会被平台判成重复推送（40054005「消息被去重」）。所以 TTL 取
+ * 最长的那档窗口（单聊 55 分钟，见 `inbound.ts`）再留余量，而不是随手取几分钟。
+ *
+ * 没有这道闸门时，这个 Map 每个入站消息长一条、永不清理——常驻进程里就是一条只会
+ * 往上走的曲线，和入站去重那个 Set 是同一类问题。
+ */
+const SEQ_TTL_MS = 60 * 60_000;
+const SEQ_CAP = 4_096;
+
+/**
  * REST 发消息客户端：群聊 `POST /v2/groups/{group_openid}/messages`、
  * 单聊 `POST /v2/users/{user_openid}/messages`。msg_seq 按 msg_id 自增
  * （同 msg_id 多次回复去重需要递增 seq）；鉴权头 `Authorization: QQBot x`，
  * 401 时失效 token 让下次请求重取。
  */
 export class QqApi {
-  private readonly seqByMsgId = new Map<string, number>();
+  private readonly seqByMsgId = new Map<string, { seq: number; at: number }>();
 
   constructor(
     private readonly token: AccessTokenManager,
@@ -108,14 +122,27 @@ export class QqApi {
   }
 
   private nextSeq(msgId: string): number {
-    const next = (this.seqByMsgId.get(msgId) ?? 0) + 1;
-    this.seqByMsgId.set(msgId, next);
+    const now = Date.now();
+    const prior = this.seqByMsgId.get(msgId);
+    // 过期即视为一个全新的窗口：留着旧的计数只会让 seq 一直涨（无害，但也没必要）。
+    if (prior !== undefined && now - prior.at >= SEQ_TTL_MS) this.seqByMsgId.delete(msgId);
+    const next = (this.seqByMsgId.get(msgId)?.seq ?? 0) + 1;
+    this.seqByMsgId.set(msgId, { seq: next, at: now });
+    if (this.seqByMsgId.size > SEQ_CAP) this.evictSeq(now);
     return next;
   }
 
-  /** 公开给流式发送用：同一被动窗口里，流式分片与普通发送共用一个 seq 账本。 */
-  drawSeq(msgId: string): number {
-    return this.nextSeq(msgId);
+  /** 容量维护：先清过期项，仍超上限就按插入顺序丢最旧的。 */
+  private evictSeq(now: number): void {
+    const cutoff = now - SEQ_TTL_MS;
+    for (const [id, entry] of this.seqByMsgId) {
+      if (entry.at <= cutoff) this.seqByMsgId.delete(id);
+    }
+    while (this.seqByMsgId.size > SEQ_CAP) {
+      const oldest = this.seqByMsgId.keys().next().value;
+      if (oldest === undefined) break;
+      this.seqByMsgId.delete(oldest);
+    }
   }
 
   private async send(path: string, opts: SendOptions): Promise<SentMessage[]> {
@@ -209,77 +236,6 @@ export class QqApi {
    */
   async respondInteraction(interactionId: string): Promise<void> {
     await this.request(`/interactions/${interactionId}`, { code: 0 });
-  }
-
-  /**
-   * 撤回一条单聊消息（`DELETE /v2/users/{openid}/messages/{message_id}`）。
-   * 平台时限 2 分钟，过期由服务端拒绝（如实上抛，调用方尽力而为即可）。
-   */
-  async deleteC2CMessage(userOpenid: string, messageId: string): Promise<void> {
-    const token = await this.token.get();
-    const [status, payload] = await withDeadline(async (signal) => {
-      const res = await this.fetchFn(
-        `${this.baseUrl}/v2/users/${userOpenid}/messages/${encodeURIComponent(messageId)}`,
-        { method: 'DELETE', headers: { Authorization: `QQBot ${token}` }, signal },
-      );
-      if (res.status === 401) this.token.invalidate();
-      const parsed = await res.json().catch(() => undefined);
-      return [res.status, parsed] as const;
-    }, 'delete message');
-    if (status < 200 || status >= 300) {
-      throw new QqApiError('delete failed', status, payload);
-    }
-  }
-
-  /**
-   * 单聊流式消息（`POST /v2/users/{openid}/stream_messages`）。
-   *
-   * 同一张卡片边生成边长：首片不带 `stream_msg_id`（服务端在响应 `id` 里发回一个），
-   * 后续片携带它并递增 `index`。`input_state` 1 = 生成中，10 = 生成结束。
-   * 仅单聊开放；群聊没有对应接口，调用方须按对端类型分流。
-   */
-  async sendStreamC2C(
-    userOpenid: string,
-    p: {
-      text: string;
-      mode: 'append' | 'replace';
-      state: 1 | 10;
-      index: number;
-      contentType: 'text' | 'markdown';
-      streamMsgId?: string;
-      msgId?: string;
-      /** 与普通发送共账本的被动去重序号（`drawSeq`）。 */
-      msgSeq?: number;
-    },
-  ): Promise<{ id: string; streamMsgId: string | undefined }> {
-    const body: Record<string, unknown> = {
-      input_mode: p.mode,
-      input_state: p.state,
-      index: p.index,
-      content_type: p.contentType,
-      content_raw: p.text,
-    };
-    if (p.streamMsgId !== undefined) body['stream_msg_id'] = p.streamMsgId;
-    else if (p.msgId !== undefined) body['msg_id'] = p.msgId;
-    if (p.msgSeq !== undefined) body['msg_seq'] = p.msgSeq;
-    const accessToken = await this.token.get();
-    const [status, payload] = await withDeadline(async (signal) => {
-      const res = await this.fetchFn(`${this.baseUrl}/v2/users/${userOpenid}/stream_messages`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `QQBot ${accessToken}` },
-        body: JSON.stringify(body),
-        signal,
-      });
-      if (res.status === 401) this.token.invalidate();
-      const parsed = await res.json().catch(() => undefined);
-      return [res.status, parsed] as const;
-    }, 'send stream message');
-    if (status < 200 || status >= 300) {
-      throw new QqApiError('stream send failed', status, payload);
-    }
-    const id = typeof payload === 'object' && payload !== null ? (payload as { id?: unknown }).id : undefined;
-    // 官方响应的 `id` 字段首片即 stream_msg_id（同一字段两用）。
-    return { id: typeof id === 'string' ? id : '', streamMsgId: typeof id === 'string' ? id : undefined };
   }
 
   private async request(path: string, body: unknown): Promise<unknown> {

@@ -19,10 +19,9 @@
  *  - **无 GUI 服务器**：`noa` 重启后，每个对话必须还在原来的那段会话里，否则
  *    每次重启都悄悄从头开始——那正好是这个形态最不想要的东西。
  */
-import { errMessage, type AgentSession, type SessionService } from '@noa/core';
-import { clampTier, type AccessTier } from './access.js';
+import { errMessage, type AgentSession, type PricingTable, type SessionService } from '@noa/core';
 import type { BindingsStore } from './bindings.js';
-import type { Peer } from './types.js';
+import type { Peer, TurnInput } from './types.js';
 import { PendingAsks } from './ask-forward.js';
 import { answerPendingQuestion } from './question-answer.js';
 import { EMPTY_TURN_LINE } from './progress.js';
@@ -32,15 +31,29 @@ import type { RichSend } from './protocol.js';
 import { liveCandidateOf, relayCandidates } from './relay-candidates.js';
 import { promptOnce } from './turn.js';
 import { turnObserver } from './observer.js';
+import type { ModelControl, ModelDefaultsPort } from '@noa/core';
+import type { NoticeKind, OutboxResult } from './outbox.js';
 
-/** 往 QQ 主动推一行（审批问题与过程回传要用；被动窗口由通道保证）。 */
 /** 一条要发回去的回答：文本，加上可选的富样式（markdown 正文 + 按钮）。 */
 export interface RemoteAnswer {
   text: string;
   rich?: RichSend;
 }
 
-export type PeerNotifier = (peer: Peer, text: string, rich?: RichSend) => void;
+/**
+ * 往 QQ 主动推一行（过程回传、审批与提问卡片；被动窗口由通道保证）。
+ *
+ * 返回 `OutboxResult` 而不是 `void`：审批与提问**整轮都停在这条消息上**，所以推送
+ * 被拒（窗口没了、额度花光了）必须能被调用方看见——看不见的拒绝在线上就是「卡片从没
+ * 出现，三分钟后按超时拒绝」，而那个理由是假的：对端从没被问到。缺省实现返回
+ * `undefined`（未知），调用方据此保持原来的等待行为。
+ */
+export type PeerNotifier = (
+  peer: Peer,
+  text: string,
+  rich?: RichSend,
+  kind?: NoticeKind,
+) => OutboxResult | undefined;
 
 /**
  * The kernel's command catalog, as this package sees it.
@@ -84,13 +97,21 @@ export interface PeerTurnDeps {
   /** The kernel's slash-command catalog, when this process has one. */
   commands?: RemoteCommandSeat;
   /**
-   * The strongest tier a remote peer may take for its own conversation.
+   * What each model costs, when the deployment wrote a price table.
    *
-   * A THUNK because the operator can lower it in the settings page while a peer
-   * is mid-conversation: a ceiling read at construction would keep granting what
-   * the page no longer says.
+   * The only reader is `/usage` (see `remote.ts`): it turns the session's token
+   * totals into an estimate, and its absence is reported as "unpriced" rather
+   * than as $0.00.
    */
-  maxTier?: () => AccessTier;
+  pricing?: PricingTable;
+  /**
+   * 模型切换座位，本进程有模型目录时才有。缺省 = `/model` 如实说切不了。
+   */
+  models?: ModelControl;
+  /**
+   * 把模型写成部署默认的座位（写配置文件）。与切换分开：能切不代表有地方写。
+   */
+  modelDefaults?: ModelDefaultsPort;
   /**
    * Whether a question published on these conversations can be answered.
    *
@@ -101,30 +122,6 @@ export interface PeerTurnDeps {
    */
   canAskUser?: () => boolean;
   notify: PeerNotifier;
-  /**
-   * 单聊流式消息座位（`stream_messages`）：接线后，一轮里每条助手文本都会边生成
-   * 边长在一张卡片上。缺省 = 不流式，叙述与回复照旧走普通发送。
-   */
-  streamText?: (
-    peer: Peer,
-    text: string,
-    state: 1 | 10,
-    index: number,
-    streamMsgId?: string,
-  ) => Promise<{ streamMsgId?: string } | void>;
-  /** 正式回复落地后清扫过程叙述（撤回）；缺省 = 叙述留着。 */
-  recallNarration?: (peer: Peer) => void;
-  /**
-   * 流式卡片中途发不出去时把它撤掉；缺省 = 卡片留着。不撤的代价是读者看到两份：
-   * 一段截断且永远收不了口的卡片，加一条回落发出的完整正文。撤回尽力而为。
-   */
-  recallStream?: (peer: Peer, messageId: string) => Promise<void>;
-  /** 现在要不要走流式（断路器）；缺省 = 要。判定与停用时长都归装配层（见 `observer.ts`）。 */
-  streamGate?: () => boolean;
-  /** 一次流式彻底失败；装配层据此决定要不要断开断路器。 */
-  onStreamBroken?: (err: unknown) => void;
-  /** 诊断留痕（流式失败等）；缺省 = 静默。 */
-  log?: (line: string) => void;
   /**
    * 把本地文件发到某个对端（模型工具入口）。缺省 = 没有这个座位，工具如实说发不了。
    * 只按 `peerId` 走，因为发送只需要被动窗口，不需要 `Peer` 的其它字段。
@@ -168,11 +165,12 @@ export class PeerTurns {
    *     should release;
    *  4. everything else, verbatim, as a prompt — a chain, not a whitelist, so an
    *     unparsed line is never swallowed.
-   * @param text - 入站消息。
+   * @param turn - 入站这一轮：文本，加上随消息来的图片（无图则缺省）。
    * @param peer - 发消息的 QQ 对端。
    * @returns 回复文本；空串表示「这一轮已经自己把话说完并送出去了」。
    */
-  async run(text: string, peer: Peer): Promise<RemoteAnswer> {
+  async run(turn: TurnInput, peer: Peer): Promise<RemoteAnswer> {
+    const text = turn.text;
     const parsed = parseRemoteCommand(text);
     if (parsed.command !== undefined) return await this.runRemote(parsed.command, peer);
     const slash = splitSlash(text);
@@ -188,32 +186,46 @@ export class PeerTurns {
     if (pending.length > 0 && slash === undefined) {
       return { text: answerPendingQuestion(pending, (id, answer) => agent.resolveQuestion(id, answer), text) };
     }
+    return await this.runPrompt(agent, turn, peer);
+  }
+
+  /**
+   * 第 4 道门：一句提示词 → 一轮。
+   *
+   * Extracted so `/retry` can enter HERE rather than through the command doors: a
+   * retry re-asks the question that opened the dropped turn, and that text must
+   * not be re-parsed (it reached this door once already precisely because it was
+   * not a command) nor re-checked against the question broker (the turn it is
+   * replacing is gone, so a parked question it answered is gone with it).
+   * @param agent - the session handle in force.
+   * @param turn - 这一轮：文本，加上随消息来的图片。
+   * @param peer - 发消息的 QQ 对端。
+   * @returns 回复文本。
+   */
+  private async runPrompt(agent: AgentSession, turn: TurnInput, peer: Peer): Promise<RemoteAnswer> {
     const observer = turnObserver(peer, this.deps);
-    const result = await promptOnce(agent, this.asks, text, peer, observer);
+    const result = await promptOnce(agent, this.asks, turn, peer, observer);
     // The ANSWER is RETURNED, not relayed. `notify` is the NARRATION class, capped
     // below the reply allowance on purpose so a busy turn cannot spend the answer's
     // reserve — so delivering the answer through it made the one message the peer
     // was waiting for the one message that could be dropped. Returning it hands it
     // to the channel's reply seat, which spends the reserve.
     if (result.reply.trim().length === 0) {
-      // Nothing to say: the "finished, no text" line is narration, and there is
-      // nothing for the caller to deliver. A turn that was CUT SHORT is the one
-      // exception: the new message (or `/stop`) that interrupted it is already
-      // being answered, so the floor line would answer a question nobody asked.
-      if (result.aborted !== true) this.deps.notify(peer, EMPTY_TURN_LINE);
-      this.deps.recallNarration?.(peer);
-      return { text: '' };
-    }
-    // Already fully delivered by its streaming card (state 10 with the full
-    // text): returning the body would make the peer read the answer twice.
-    if (result.streamed === true) {
-      this.deps.recallNarration?.(peer);
-      return { text: '' };
+      // Nothing to say: the "finished, no text" line IS this turn's answer, so it
+      // goes out through the answer path — which is also what buys it the two
+      // things narration cannot give it: the reserved allowance, and a reply that
+      // is never taken back. A turn that was CUT SHORT is the one exception: the
+      // new message (or `/stop`) that interrupted it is already being answered,
+      // so the floor line would answer a question nobody asked.
+      return result.aborted === true ? { text: '' } : { text: EMPTY_TURN_LINE };
     }
     // The reply goes out as MARKDOWN: the client renders headings, bold, lists
     // and code instead of raw characters. A plain-text fallback on platform
     // refusal is folded in at the protocol layer, so nothing is lost.
-    this.deps.recallNarration?.(peer);
+    //
+    // 发出去就不再动它：没有流式卡片要收口，也没有「答案落地后撤掉过程」这一步
+    // ——Hermes 的 QQ 适配器从不撤回任何消息，而「消息自己消失」正是读者最难理解
+    // 的一种行为。
     return { text: result.reply, rich: { markdown: result.reply } };
   }
 
@@ -294,6 +306,11 @@ export class PeerTurns {
     peer: Peer,
   ): Promise<RemoteAnswer> {
     const agent = await this.agentFor(peer);
+    // 模型座位是**可选**的两块：切换（有模型目录才有）与写默认（有可写配置才有）。
+    // 分别映射到通道自己的 `models` 座位，`/model` 因此能如实区分「切不了」与
+    // 「切了但默认没写成」。
+    const seat = this.deps.models;
+    const defaults = this.deps.modelDefaults;
     const kernel: RemoteKernelPort = {
       rootDir: () => this.deps.rootDir() ?? '',
       // The model in force is KNOWABLE (the `llm` service publishes it) even
@@ -301,6 +318,17 @@ export class PeerTurns {
       // plugins, so `/status` reports the id and `/model` answers honestly that
       // this process has no switching seat (see `remote.ts`).
       model: () => this.deps.model(),
+      ...(seat === undefined ? {} : {
+        models: {
+          current: () => seat.current(),
+          list: () => seat.list(),
+          select: (model) => seat.select(model),
+          ...(defaults === undefined ? {} : {
+            setDefault: (model) => defaults.setDefault(model),
+            configuredDefault: () => defaults.configured(),
+          }),
+        },
+      }),
     };
     const outcome = await runRemoteCommand(command, {
       kernel,
@@ -313,15 +341,22 @@ export class PeerTurns {
         running: () => agent.running,
         pendingQuestions: () => agent.pendingQuestions(),
         resolveQuestion: (id, answer) => agent.resolveQuestion(id, answer),
+        usage: () => agent.usageSnapshot(),
+        rewind: (turns) => agent.rewindTurns(turns),
       },
-      maxTier: this.deps.maxTier?.(),
       relay: this.relayPort(agent, peer),
+      ...(this.deps.pricing === undefined ? {} : { pricing: this.deps.pricing }),
       // `/new` runs through the ONE command implementation, which hands the new
       // session back; rebinding happens here, where the peer map lives, instead of
       // a second `/new` branch in this class.
       newSession: () => this.newSession(peer),
     });
     if (outcome.nextAgent !== undefined) this.peers.set(peer.peerId, outcome.nextAgent);
+    // `/retry`: the command described the cut and what to say again; the RUN goes
+    // through the same prompt door as any other message, so a retried turn cannot
+    // behave differently from the turn it replaces. The handle is re-read because
+    // the rebind above may have replaced it.
+    if (outcome.resend !== undefined) return await this.runPrompt(await this.agentFor(peer), outcome.resend, peer);
     return { text: outcome.reply, ...(outcome.rich !== undefined ? { rich: outcome.rich } : {}) };
   }
 
@@ -418,9 +453,6 @@ export class PeerTurns {
   /** Reopen a bound log, keeping the binding's kind (a relay stays a relay). */
   private async resume(peer: Peer, bound: { kind: 'own' | 'relay'; file: string }): Promise<AgentSession> {
     const agent = await this.open({ resumeFile: bound.file });
-    // A conversation this chat OWNS is subject to the remote ceiling like a fresh
-    // one; a RELAY is somebody else's conversation and must not be re-tiered.
-    if (bound.kind === 'own') this.capOwnedTier(agent);
     this.peers.set(peer.peerId, agent);
     // The file can change on resume in principle (it does not today, but the
     // binding is the durable fact and must record what actually opened).
@@ -430,33 +462,9 @@ export class PeerTurns {
 
   private async newSession(peer: Peer): Promise<AgentSession> {
     const agent = await this.open({});
-    this.capOwnedTier(agent);
     this.peers.set(peer.peerId, agent);
     await this.bind(peer, { kind: 'own', file: agent.session.file });
     return agent;
-  }
-
-  /**
-   * Clamp a conversation this chat OWNS to the channel's tier ceiling.
-   *
-   * `maxTier` used to be enforced only on `/perm`, so it governed the VERB and not
-   * the execution: a machine running at `full` (`config.approval`) handed every
-   * bound peer a `full` conversation, and the operator's ceiling did nothing until
-   * the peer happened to type `/perm`. The tier is a per-session fact, so it is
-   * clamped at the moment the conversation is created.
-   *
-   * Deliberately NOT applied to a RELAYED conversation: lowering a desktop
-   * session's tier because a phone pointed at it would let the remote ceiling
-   * contaminate the desktop. Capping a relayed call needs the ceiling to travel
-   * with the CALLER (a per-call principal), which this channel does not have yet.
-   * @param agent - the conversation just opened for this chat.
-   */
-  private capOwnedTier(agent: AgentSession): void {
-    const ceiling: AccessTier = this.deps.maxTier?.() ?? 'read-only';
-    const mode = agent.approvalMode;
-    if (mode === undefined) return;
-    const capped = clampTier(mode, ceiling);
-    if (capped !== mode) agent.setApprovalMode(capped);
   }
 
   /**

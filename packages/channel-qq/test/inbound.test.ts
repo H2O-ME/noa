@@ -46,9 +46,9 @@ function makeHandler(): { handler: InboundHandler; rig: Rig } {
   const handler = new InboundHandler({
     // The first prompt parks until `release()`, standing in for a turn stopped on
     // an approval; a normal prompt would wait for it in the serial queue.
-    brain: (text) => {
-      brainCalls.push(text);
-      return text === 'park' ? gate.then(() => 'parked-done') : Promise.resolve(`echo:${text}`);
+    brain: (turn) => {
+      brainCalls.push(turn.text);
+      return turn.text === 'park' ? gate.then(() => 'parked-done') : Promise.resolve(`echo:${turn.text}`);
     },
     reply,
     log: () => undefined,
@@ -105,7 +105,7 @@ describe('inbound counters', () => {
     const reply: ReplySink = {
       reply: () => (failure ? Promise.resolve({ ok: false, reason: 'rate limited' }) : Promise.resolve({ ok: true })),
     };
-    const counting = new InboundHandler({ brain: (text) => Promise.resolve(`echo:${text}`), reply, log: () => undefined });
+    const counting = new InboundHandler({ brain: (turn) => Promise.resolve(`echo:${turn.text}`), reply, log: () => undefined });
 
     counting.onDispatch({ t: 'GROUP_AT_MESSAGE_CREATE', d: groupMessage('m1', 'hi') });
     await settle();

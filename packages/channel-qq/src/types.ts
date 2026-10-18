@@ -1,4 +1,5 @@
 /** 入站事件负载（官方 autogen 事件页；字段按官方示例）。 */
+import type { ImageAttachmentRef } from '@noa/core';
 
 export interface QqAuthor {
   id?: string;
@@ -10,11 +11,37 @@ export interface QqAuthor {
   username?: string;
 }
 
+/** 入站附件（图片/语音/文件）；字段按官方示例，全部可缺省。 */
+export interface QqAttachment {
+  /**
+   * The platform's own type tag: `image/jpeg`, `image/png`, `voice`, `video/mp4`,
+   * `file`, … A `file` tag means an EXPLICIT upload (a `.wav` someone attached),
+   * which must never be routed into speech recognition — see `media-inbound.ts`.
+   */
+  content_type?: string;
+  /** Media URL on the QQ CDN. Requires `Authorization: QQBot <token>` to fetch. */
+  url?: string;
+  filename?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  /**
+   * QQ's own free speech-to-text of a voice attachment. Preferred over any
+   * configured transcriber: it costs nothing, needs no download, and is the
+   * platform's own reading of the audio.
+   */
+  asr_refer_text?: string;
+  /** A pre-converted WAV of a voice attachment — usable without SILK decoding. */
+  voice_wav_url?: string;
+}
+
 export interface QqMessagePayload {
   /** 消息 id：被动回复的 msg_id（外层事件的 d.id）。 */
   id: string;
   author: QqAuthor;
   content: string;
+  /** 图片/语音/文件附件；纯文本消息没有这个键。 */
+  attachments?: readonly QqAttachment[];
   group_openid?: string;
   timestamp?: string;
 }
@@ -51,6 +78,19 @@ export interface Peer {
   actorId: string;
 }
 
+/**
+ * One inbound turn, as the brain receives it.
+ *
+ * Text plus the durable image references resolved from the message's
+ * attachments. `images` is ABSENT rather than empty for a text-only message, so
+ * the common path carries nothing extra — and the log stays byte-identical to
+ * what it was before images existed.
+ */
+export interface TurnInput {
+  readonly text: string;
+  readonly images?: readonly ImageAttachmentRef[];
+}
+
 /** The bot's own mentions at the START of a group message, as the platform sends them. */
 const LEADING_MENTION = /^(?:\s*<@!?[A-Za-z0-9_-]+>|\s*<@!?[A-Za-z0-9_-]+>\s*)+/u;
 
@@ -83,7 +123,18 @@ export function parseInbound(t: string, d: unknown): { peer: Peer; message: QqMe
   // connection.
   if (typeof d !== 'object' || d === null || Array.isArray(d)) return undefined;
   const msg = d as QqMessagePayload;
-  if (typeof msg.content !== 'string' || typeof msg.id !== 'string') return undefined;
+  if (typeof msg.id !== 'string') return undefined;
+  // A message is TEXT or ATTACHMENTS (or both). A picture sent with no caption has
+  // `content: ''` — requiring non-empty text here is what silently dropped every
+  // image-only message.
+  const content = typeof msg.content === 'string' ? msg.content : '';
+  const attachments = parseAttachments(msg.attachments);
+  if (content.length === 0 && attachments.length === 0) return undefined;
+  const normalized: QqMessagePayload = {
+    ...msg,
+    content,
+    ...(attachments.length > 0 ? { attachments } : {}),
+  };
   if (t === 'GROUP_AT_MESSAGE_CREATE') {
     if (typeof msg.group_openid !== 'string' || msg.group_openid.length === 0) return undefined;
     // The platform puts the robot's own mention INTO `content` for a group
@@ -99,10 +150,41 @@ export function parseInbound(t: string, d: unknown): { peer: Peer; message: QqMe
         // The MEMBER, not the group: see `Peer.actorId`.
         actorId: typeof msg.author?.member_openid === 'string' ? msg.author.member_openid : '',
       },
-      message: { ...msg, content: stripLeadingMention(msg.content) },
+      message: { ...normalized, content: stripLeadingMention(content) },
     };
   }
   const user = typeof msg.author?.user_openid === 'string' ? msg.author.user_openid : '';
   if (user.length === 0) return undefined;
-  return { peer: { kind: 'c2c', openid: user, peerId: `c2c:${user}`, actorId: user }, message: msg };
+  return { peer: { kind: 'c2c', openid: user, peerId: `c2c:${user}`, actorId: user }, message: normalized };
 }
+
+/**
+ * Keep only the attachments that are really usable: an object with a non-empty
+ * `url`. Everything else (a string, a null, an entry with no URL) is dropped —
+ * the payload crosses the platform boundary as `unknown` and must be read
+ * defensively, exactly like the message itself.
+ * @param raw - the payload's `attachments`, of unknown shape.
+ * @returns the usable attachments, in the order the platform sent them.
+ */
+export function parseAttachments(raw: unknown): QqAttachment[] {
+  if (!Array.isArray(raw)) return [];
+  const out: QqAttachment[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
+    const att = entry as Record<string, unknown>;
+    const url = typeof att['url'] === 'string' ? att['url'].trim() : '';
+    if (url.length === 0) continue;
+    out.push({
+      url,
+      ...(typeof att['content_type'] === 'string' ? { content_type: att['content_type'] } : {}),
+      ...(typeof att['filename'] === 'string' ? { filename: att['filename'] } : {}),
+      ...(typeof att['size'] === 'number' ? { size: att['size'] } : {}),
+      ...(typeof att['width'] === 'number' ? { width: att['width'] } : {}),
+      ...(typeof att['height'] === 'number' ? { height: att['height'] } : {}),
+      ...(typeof att['asr_refer_text'] === 'string' ? { asr_refer_text: att['asr_refer_text'] } : {}),
+      ...(typeof att['voice_wav_url'] === 'string' ? { voice_wav_url: att['voice_wav_url'] } : {}),
+    });
+  }
+  return out;
+}
+

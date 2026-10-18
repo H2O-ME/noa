@@ -26,7 +26,7 @@ function rig(overrides: { windowAllowance?: number; narrationAllowance?: number 
   const outbox = new QqOutbox({
     send: async (peerId, content, msgId) => {
       sent.push({ peerId, content, ...(msgId !== undefined ? { msgId } : {}) });
-      return '1 message(s), last id out-1';
+      return ['out-1'];
     },
     lastMsgIdOf: () => window,
     ...overrides,
@@ -75,6 +75,35 @@ describe('the outbox owns the window and the allowance', () => {
     const { outbox, sent } = rig();
     expect((await outbox.reply(PEER, '   ')).ok).toBe(false);
     expect(sent).toEqual([]);
+  });
+
+  it('lets a card through after progress lines have spent the narration cap', () => {
+    // The live failure, in one test: a turn touched three tools, three progress
+    // lines spent the narration cap exactly (`PROGRESS_MAX_UPDATES` and
+    // `NARRATION_ALLOWANCE` are both 3), and the approval card — the one message the
+    // whole run was stopped on — was refused by that same cap. Nothing appeared in
+    // the chat, so nothing could be clicked, and the approval died on its timer
+    // reporting that the peer had not answered a question they never received.
+    const { outbox, sent } = rig();
+    for (let i = 0; i < NARRATION_ALLOWANCE; i++) outbox.narrate(PEER, `正在: 工具 ${i}`);
+
+    const card = outbox.narrate(PEER, '**需要审批：bash**', undefined, 'interaction');
+
+    expect(card).toEqual({ ok: true });
+    expect(sent.map((entry) => entry.content)).toContain('**需要审批：bash**');
+  });
+
+  it('still never lets a card spend the reply it is waiting on', async () => {
+    // Cards outrank narration, but the reserve is the one thing they cannot take:
+    // the run they belong to still has to be able to say its conclusion.
+    const { outbox, sent } = rig();
+    for (let i = 0; i < WINDOW_ALLOWANCE; i++) outbox.narrate(PEER, `卡片 ${i}`, undefined, 'interaction');
+    expect(sent.map((entry) => entry.content)).toHaveLength(WINDOW_ALLOWANCE - 1);
+    expect(outbox.narrate(PEER, '再来一张', undefined, 'interaction').reason).toContain('interaction allowance spent');
+
+    const reply = await outbox.reply(PEER, '结论');
+    expect(reply.ok).toBe(true);
+    expect(sent.at(-1)?.content).toBe('结论');
   });
 });
 

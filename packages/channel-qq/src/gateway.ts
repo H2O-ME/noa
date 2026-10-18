@@ -25,6 +25,15 @@ export const OP = {
 /** 群聊 + 单聊（C2C）事件 intent（1<<25 = 33554432）。 */
 export const INTENT_GROUP_AND_C2C = 1 << 25;
 
+/**
+ * A connection that dies this fast never did any work, so it is a symptom rather
+ * than a transient: bad credentials, or a bot missing the permissions the intent
+ * requires. Three in a row is the signal to stop retrying at full speed and say
+ * what to check.
+ */
+const QUICK_DISCONNECT_MS = 5_000;
+const MAX_QUICK_DISCONNECTS = 3;
+
 export interface GatewayDispatch {
   /** 事件类型（GROUP_AT_MESSAGE_CREATE / C2C_MESSAGE_CREATE / READY …）。 */
   t: string;
@@ -100,6 +109,10 @@ export class QqGateway {
   /** Bumped by every connect and by close; see the class comment. */
   private generation = 0;
   private state: QqGatewayState = 'idle';
+  /** 本连接的建立时刻（量「连上多久就断」用）；未连即 undefined。 */
+  private connectedAt: number | undefined;
+  /** 连续「连上就断」的次数；一次像样的连接把它清零。 */
+  private quickDisconnects = 0;
 
   constructor(private readonly opts: QqGatewayOptions) {}
 
@@ -134,6 +147,7 @@ export class QqGateway {
       return;
     }
     this.socket = socket;
+    this.connectedAt = Date.now();
     // Every callback is bound to THIS generation, so an older socket's late frame
     // or close cannot reach the current connection's state.
     socket.onMessage((data) => {
@@ -150,8 +164,29 @@ export class QqGateway {
       if (this.socket !== socket) return;
       this.socket = undefined;
       this.stopTimers();
-      void this.scheduleReconnect('connection closed');
+      void this.scheduleReconnect(this.noteDisconnect());
     });
+  }
+
+  /**
+   * 首次拨号：失败就交给重连路径继续拨，而不是把失败交回调用方。
+   *
+   * `connect()` 会抛，因为它要一个能报告「凭据配错了」的调用方；而常驻通道的
+   * **首次**拨号没有这样的调用方——没有人会再手敲一遍命令。一次瞬时失败
+   * （DNS / TLS / 连接被重置）曾经让进程打完横幅、发现没有通道、然后退出：
+   * 运维看到的是「干净退出、机器人不在」。所以首次拨号并入网关自己的重连路径，
+   * 按退避一直重试到 `close()`。
+   */
+  async begin(): Promise<void> {
+    if (this.disposed) return;
+    try {
+      await this.connect();
+    } catch (err) {
+      // `close()` 可能落在失败的拨号之后：网关是终态的，此时不再排重连。
+      if (!this.isCurrent(this.generation)) return;
+      this.log(`connect failed: ${errMessage(err)}`);
+      void this.scheduleReconnect('initial connect failed');
+    }
   }
 
   /**
@@ -183,6 +218,36 @@ export class QqGateway {
 
   private isCurrent(gen: number): boolean {
     return !this.disposed && gen === this.generation;
+  }
+
+  /**
+   * 记账一次断线，返回给重连日志的理由。
+   *
+   * 「连上就断」与「跑了很久才断」是两件不同的事：后者是网络抖动，前者几乎总是配置或
+   * 权限问题——凭据错、或机器人没拿到该 intent 需要的权限。连续三次快速断开后把退避
+   * 抬到上限并说清要检查什么，而不是以 1s 的节奏无限重连、把日志刷成一片。
+   * @returns the reason line for the reconnect log.
+   */
+  private noteDisconnect(): string {
+    const at = this.connectedAt;
+    this.connectedAt = undefined;
+    if (at === undefined) return 'connection closed';
+    const lasted = Date.now() - at;
+    if (lasted >= QUICK_DISCONNECT_MS) {
+      // A connection that lasted is evidence the setup works; the streak resets.
+      this.quickDisconnects = 0;
+      return 'connection closed';
+    }
+    this.quickDisconnects += 1;
+    if (this.quickDisconnects >= MAX_QUICK_DISCONNECTS) {
+      this.log(
+        `连接连续 ${this.quickDisconnects} 次在 ${QUICK_DISCONNECT_MS / 1000}s 内断开。`
+        + '请检查：1) AppID / AppSecret 是否正确；2) 机器人是否已在 QQ 开放平台获得所需的权限。',
+      );
+      this.backoffMs = this.opts.maxBackoffMs ?? 30_000;
+      return `quick disconnect ×${this.quickDisconnects} — backing off`;
+    }
+    return `quick disconnect (${lasted}ms) ×${this.quickDisconnects}`;
   }
 
   private setState(state: QqGatewayState): void {
@@ -219,10 +284,14 @@ export class QqGateway {
       if (t === 'READY') {
         if (typeof frame.d?.['session_id'] === 'string') this.sessionId = frame.d['session_id'];
         this.backoffMs = 1_000;
+        // A real READY clears the quick-disconnect streak: the setup demonstrably
+        // works, so a later drop is a transient rather than a misconfiguration.
+        this.quickDisconnects = 0;
         this.setState('ready');
         this.opts.onReady?.({ sessionId: this.sessionId ?? '', resumed: false });
       } else if (t === 'RESUMED') {
         this.backoffMs = 1_000;
+        this.quickDisconnects = 0;
         this.setState('ready');
         this.opts.onReady?.({ sessionId: this.sessionId ?? '', resumed: true });
       }

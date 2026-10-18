@@ -93,17 +93,15 @@ describe('ProgressRelay', () => {
   /** A realistic (far-from-zero) clock, so the throttle baseline is really exercised. */
   const T0 = 1_700_000_000_000;
 
-  it('says nothing before the answer — no receipt, no immediate progress', () => {
+  it('says nothing immediately — no receipt, and the first flush waits for the interval', () => {
     // The complaint this encodes: every inbound message drew a "收到，开始处理"
     // receipt, so a quick answer cost the peer TWO messages and the reader learned
     // nothing. Narration is now the work itself, and it waits for the interval.
-    let clock = T0;
+    const clock = T0;
     const sent: string[] = [];
     const relay = new ProgressRelay({ send: (line) => sent.push(line), minIntervalMs: 1_000, now: () => clock });
     relay.tool('read_file');
     expect(sent).toEqual([]);
-    relay.final('这是结论');
-    expect(sent).toEqual(['这是结论']);
   });
 
   it('coalesces tools inside one interval and throttles', () => {
@@ -122,8 +120,10 @@ describe('ProgressRelay', () => {
     expect(sent).toHaveLength(1);
   });
 
-  it('always delivers the answer, even when the progress budget is spent', () => {
-    // The answer is what was asked for. Narration is droppable; the result is not.
+  it('stops narrating once the budget is spent, leaving the reply reserve alone', () => {
+    // The answer does NOT travel through this relay (it goes to the reply seat, which
+    // is why that seat keeps a reserve — see `outbox-answers.test.ts`). So what the cap
+    // protects is the reserve itself: narration simply stops.
     let clock = T0;
     const sent: string[] = [];
     const relay = new ProgressRelay({ send: (line) => sent.push(line), minIntervalMs: 1_000, maxUpdates: 1, now: () => clock });
@@ -131,30 +131,50 @@ describe('ProgressRelay', () => {
     clock += 1_000;
     relay.tool('grep'); // spends the only update
     clock += 1_000;
-    relay.tool('bash'); // budget gone: the narration is dropped, the answer is not
-    relay.final('这是结论');
+    relay.tool('bash'); // budget gone: nothing more goes out
+    clock += 1_000;
+    relay.tool('edit_file');
 
-    expect(sent.filter((line) => line.includes('正在'))).toHaveLength(1);
-    expect(sent.at(-1)).toBe('这是结论');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('grep');
   });
 
-  it('says so when a turn produced no text, instead of going silent', () => {
+  it('does not repeat the same tool line, and keeps the budget for a line that says something', () => {
+    // 实测：一次「你对我有什么记忆」连调两次 recall，聊天里出现两条一模一样的
+    // 「正在：recall」。读者学不到任何东西，却要多收一条消息 —— 而且那时叙述额度还和
+    // 审批卡共用，重复的一行能把它挤没（见 `outbox.ts` 的 `NoticeKind`）。
+    //
+    // 额度只给到 2，所以「重复的一行没花钱」这件事是可证的：若它花了，第三条
+    // （内容不同的 `bash`）就会被上限挡下，而它出来了。
+    let clock = T0;
     const sent: string[] = [];
-    const relay = new ProgressRelay({ send: (line) => sent.push(line) });
-    relay.final('   ');
-    expect(sent.at(-1)).toContain('没有要说的文本');
+    const relay = new ProgressRelay({ send: (line) => sent.push(line), minIntervalMs: 1_000, maxUpdates: 2, now: () => clock });
+    clock += 1_000;
+    relay.tool('recall'); // spends update 1
+    clock += 1_000;
+    relay.tool('recall'); // 与上一条一字不差：不发，也不花额度
+    clock += 1_000;
+    relay.tool('bash'); // 额度还在，所以这句说得出来
+    clock += 1_000;
+    relay.tool('edit_file'); // 两格花完，到此为止
+
+    expect(sent).toEqual(['正在：recall', '正在：bash']);
   });
 
   it('absorbs a failing transport', () => {
     // A chat that cannot be reached must never fail the turn it describes.
+    let clock = T0;
     const relay = new ProgressRelay({
+      minIntervalMs: 0,
+      now: () => clock,
       send: () => {
         throw new Error('rate limited');
       },
     });
     expect(() => {
       relay.tool('bash');
-      relay.final('done');
+      clock += 1;
+      relay.tool('edit_file');
     }).not.toThrow();
   });
 });

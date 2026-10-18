@@ -7,7 +7,7 @@
  *  - 远程审批超时**必拒**——一个挂着的审批会把整轮运行永久停住，QQ 对端随时可能不回。
  */
 import { describe, expect, it, vi } from 'vitest';
-import type { ApprovalMode, AskResult } from '@noa/core';
+import type { ApprovalMode, AskResult, PricingTable, TurnRewind, UsageStats } from '@noa/core';
 import {
   awaitRemoteAnswer,
   runRemoteCommand,
@@ -27,12 +27,12 @@ function fakeRelay(candidates: RelayCandidate[] = []): RemoteRelayPort {
 }
 
 /** 一个记下所有动作的假内核 + 假会话。`mode: undefined` 模拟没有权限服务的会话。 */
-function makeCtx(opts: { mode?: ApprovalMode; noPermissionService?: boolean; pending?: { id: string; call: { name: string } }[]; relay?: boolean } = {}) {
+function makeCtx(opts: { mode?: ApprovalMode; noPermissionService?: boolean; pending?: { id: string; call: { name: string } }[]; relay?: boolean; usage?: UsageStats; noUsageSeat?: boolean; pricing?: PricingTable; rewind?: (turns: number) => Promise<TurnRewind | undefined>; noSetDefault?: boolean; setDefault?: { ok: boolean; reason?: string }; selectRefusal?: string; configuredDefault?: string } = {}) {
   const calls: string[] = [];
   // A session WITHOUT a permission service: `setApprovalMode` no-ops and the
   // read-back stays undefined — the case the "did it land" check exists for.
   const detached = opts.noPermissionService === true;
-  let mode: ApprovalMode | undefined = detached ? undefined : (opts.mode ?? 'read-only');
+  let mode: ApprovalMode | undefined = detached ? undefined : (opts.mode ?? 'auto');
   const resolved: { id: string; answer: AskResult }[] = [];
   const ctx: RemoteContext = {
     kernel: {
@@ -46,9 +46,19 @@ function makeCtx(opts: { mode?: ApprovalMode; noPermissionService?: boolean; pen
         current: () => 'model-a',
         list: () => Promise.resolve([{ models: [{ id: 'model-a' }, { id: 'model-b' }] }]),
         select: (model) => {
+          if (opts.selectRefusal !== undefined) return Promise.reject(new Error(opts.selectRefusal));
           calls.push(`model:${model}`);
           return Promise.resolve({ id: model });
         },
+        ...(opts.noSetDefault === true
+          ? {}
+          : {
+              setDefault: (model: string) => {
+                calls.push(`default:${model}`);
+                return Promise.resolve(opts.setDefault ?? { ok: true });
+              },
+              configuredDefault: () => Promise.resolve(opts.configuredDefault),
+            }),
       },
     },
     session: {
@@ -63,17 +73,25 @@ function makeCtx(opts: { mode?: ApprovalMode; noPermissionService?: boolean; pen
         resolved.push({ id, answer });
         return true;
       },
+      ...(opts.noUsageSeat === true ? {} : { usage: () => opts.usage ?? zeroUsage() }),
+      rewind: (turns) => {
+        calls.push(`rewind:${turns}`);
+        return opts.rewind === undefined ? Promise.resolve(undefined) : opts.rewind(turns);
+      },
     },
     newSession: () => {
       calls.push('new');
       return Promise.resolve({} as never);
     },
-    // The machine's local grant. A peer may go this high and no higher; the cap
-    // itself is pinned by its own case below.
-    maxTier: 'full',
     ...(opts.relay === true ? { relay: fakeRelay() } : {}),
+    ...(opts.pricing === undefined ? {} : { pricing: opts.pricing }),
   };
   return { ctx, calls, resolved };
+}
+
+/** 一份全零的用量读数（各用例只覆盖自己关心的字段）。 */
+function zeroUsage(overrides: Partial<UsageStats> = {}): UsageStats {
+  return { turns: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, missTokens: 0, missTurns: 0, ...overrides };
 }
 
 describe('remote command execution', () => {
@@ -92,29 +110,17 @@ describe('remote command execution', () => {
     expect(out.reply).toContain('未能切换');
   });
 
-  it('refuses a tier above the machine\'s own ceiling', async () => {
-    // The whole point of driving a machine from a chat window is that a stolen
-    // phone is not a stolen keyboard: the ceiling is applied where the tier would
-    // CHANGE, so no other path can exceed it. The refusal names the limit rather
-    // than silently granting the smaller tier, which a peer would read as success.
-    const { ctx, calls } = makeCtx();
-    const capped: RemoteContext = { ...ctx, maxTier: 'auto-edit' };
-    const refused = await runRemoteCommand({ kind: 'perm', mode: 'full' }, capped);
-    expect(refused.reply).toContain('最高只能到「自动编辑」');
-    expect(calls).not.toContain('perm:full');
-    // At or below the ceiling still works.
-    expect((await runRemoteCommand({ kind: 'perm', mode: 'auto-edit' }, capped)).reply).toContain('自动编辑');
-    expect(calls).toContain('perm:auto-edit');
-    // Absent means the WEAKEST tier, never "unlimited".
-    const bare: RemoteContext = { ...ctx, maxTier: undefined };
-    expect((await runRemoteCommand({ kind: 'perm', mode: 'full' }, bare)).reply).toContain('最高只能到「只读」');
-  });
-
   it('refuses to pretend a model switch happened with no model seat', async () => {
     const ctx = makeCtx().ctx;
     const bare: RemoteContext = { ...ctx, kernel: { ...ctx.kernel, models: undefined } };
-    expect((await runRemoteCommand({ kind: 'model', model: 'x' }, bare)).reply).toContain('没有模型座位');
-    expect((await runRemoteCommand({ kind: 'models' }, bare)).reply).toContain('没有模型座位');
+    // 而且要把话说全：座位不在是「本部署的模型写在配置文件里」，不是「端点未配置」，
+    // 更不能把人指向一个不存在的设置页（Noa 没有设置页）。
+    for (const command of [{ kind: 'model', model: 'x' } as const, { kind: 'models' } as const]) {
+      const reply = (await runRemoteCommand(command, bare)).reply;
+      expect(reply).toContain('没有模型切换座位');
+      expect(reply).toContain('config.json');
+      expect(reply).not.toContain('设置页');
+    }
   });
 
   it('lists the model ids and switches through the kernel seat', async () => {
@@ -125,6 +131,50 @@ describe('remote command execution', () => {
     const switched = await runRemoteCommand({ kind: 'model', model: 'model-b' }, ctx);
     expect(calls).toContain('model:model-b');
     expect(switched.reply).toContain('model-b');
+  });
+
+  it('a plain switch changes the process and does NOT touch the config file', async () => {
+    // 一个 provider 实例被所有对话共用，所以「切模型」本来就是全局的 —— 这一点必须
+    // 说出来，否则操作者会以为它只影响当前会话。而没写 `default` 就不该动配置文件：
+    // 重启后回到原样，回复也要这么讲。
+    const { ctx, calls } = makeCtx();
+    const out = await runRemoteCommand({ kind: 'model', model: 'model-b' }, ctx);
+    expect(calls.filter((call) => call.startsWith('default:'))).toEqual([]);
+    expect(out.reply).toContain('本进程');
+    expect(out.reply).toContain('/model default model-b');
+  });
+
+  it('`/model default <id>` switches AND writes the default', async () => {
+    const { ctx, calls } = makeCtx();
+    const out = await runRemoteCommand({ kind: 'model', model: 'model-b', persist: true }, ctx);
+    expect(calls).toContain('model:model-b');
+    expect(calls).toContain('default:model-b');
+    expect(out.reply).toContain('下次启动仍是它');
+  });
+
+  it('admits the default did not change when there is nothing to write it into', async () => {
+    // 切到了就说切到了，但别把「默认也改了」说成事实 —— 这个进程没有可写的配置文件。
+    const { ctx } = makeCtx({ noSetDefault: true });
+    const out = await runRemoteCommand({ kind: 'model', model: 'model-b', persist: true }, ctx);
+    expect(out.reply).toContain('模型已切到 model-b');
+    expect(out.reply).toContain('默认模型没改');
+  });
+
+  it('names the reason when the write-back itself is refused', async () => {
+    const { ctx } = makeCtx({ setDefault: { ok: false, reason: '配置里没有 provider 段，写不了默认模型' } });
+    const out = await runRemoteCommand({ kind: 'model', model: 'model-b', persist: true }, ctx);
+    expect(out.reply).toContain('模型已切到 model-b');
+    expect(out.reply).toContain('没有 provider 段');
+  });
+
+  it('lists what exists when the endpoint refuses the id, instead of blaming the endpoint', async () => {
+    // 拼错的名字在这里被拒并列出可选项，而不是让上游回 404、让人以为端点坏了。
+    const { ctx, calls } = makeCtx({ selectRefusal: 'unknown model: modle-b' });
+    const out = await runRemoteCommand({ kind: 'model', model: 'modle-b' }, ctx);
+    expect(out.reply).toContain('模型未切换');
+    expect(out.reply).toContain('unknown model');
+    expect(out.reply).toContain('model-a');
+    expect(calls.filter((call) => call.startsWith('default:'))).toEqual([]);
   });
 
   it('reports a workspace refusal instead of swallowing it', async () => {
@@ -158,7 +208,7 @@ describe('remote command execution', () => {
     // desktop is working in). To whoever is reading, a hidden verb IS a missing verb.
     const { ctx } = makeCtx({ relay: true });
     const help = (await runRemoteCommand({ kind: 'help' }, ctx)).reply;
-    for (const verb of ['/status', '/perm', '/model', '/ws', '/new', '/sessions', '/use', '/unbind', '/stop', '/answer', '/approve', '/deny', '/help']) {
+    for (const verb of ['/status', '/usage', '/perm', '/model', '/ws', '/new', '/sessions', '/use', '/unbind', '/stop', '/answer', '/approve', '/deny', '/help']) {
       expect(help).toContain(verb);
     }
     // The seat rule still holds: with no relay seat, the relay verbs are not
@@ -167,6 +217,15 @@ describe('remote command execution', () => {
     const bare = (await runRemoteCommand({ kind: 'help' }, makeCtx().ctx)).reply;
     expect(bare).not.toContain('/sessions');
     expect(bare).not.toContain('/unbind');
+  });
+
+  it('advertises `/model default` only when something can actually write it', async () => {
+    // 同一个座位规则：帮助里写一个做不到的动词，等于教对端一条没用的指令。
+    const withWrite = (await runRemoteCommand({ kind: 'help' }, makeCtx().ctx)).reply;
+    expect(withWrite).toContain('/model default <id>');
+    const readOnly = (await runRemoteCommand({ kind: 'help' }, makeCtx({ noSetDefault: true }).ctx)).reply;
+    expect(readOnly).toContain('/model <id>');
+    expect(readOnly).not.toContain('/model default');
   });
 
   it('renders a session row the reader can choose by', async () => {
@@ -194,6 +253,153 @@ describe('remote command execution', () => {
     const out = await runRemoteCommand({ kind: 'new' }, ctx);
     expect(calls).toContain('new');
     expect(out.nextAgent).toBeDefined();
+  });
+});
+
+describe('/undo and /retry', () => {
+  const plan = (turns: number): TurnRewind => ({
+    keepIds: ['m1'],
+    dropped: turns,
+    prompt: { id: 'u9', ts: 0, role: 'user', content: '上次那句话' },
+  });
+
+  it('reports what actually went, not what was asked for', async () => {
+    // `/undo 99` on a two-turn conversation drops two. Echoing the request would
+    // be the same class of lie as a permission switch that never landed.
+    const { ctx, calls } = makeCtx({ rewind: () => Promise.resolve({ ...plan(2), dropped: 2 }) });
+    const out = await runRemoteCommand({ kind: 'undo', turns: 99 }, ctx);
+    expect(calls).toContain('rewind:99');
+    expect(out.reply).toContain('已回退 2 轮');
+  });
+
+  it('says there is nothing to take back instead of claiming a cut', async () => {
+    const { ctx } = makeCtx({ rewind: () => Promise.resolve(undefined) });
+    expect((await runRemoteCommand({ kind: 'undo', turns: 1 }, ctx)).reply).toContain('没有可以回退的轮次');
+    expect((await runRemoteCommand({ kind: 'retry' }, ctx)).reply).toContain('没有可以重做的轮次');
+  });
+
+  it('reports the kernel refusal when a run is in flight', async () => {
+    // The kernel refuses to splice the surface under a live request; the peer has
+    // to be told, because "nothing happened" and "it refused" look identical.
+    const { ctx } = makeCtx({ rewind: () => Promise.reject(new Error('会话正在跑一轮')) });
+    expect((await runRemoteCommand({ kind: 'undo', turns: 1 }, ctx)).reply).toContain('回退失败：会话正在跑一轮');
+  });
+
+  it('makes /retry re-send the dropped turn\'s prompt, with no reply of its own', async () => {
+    const { ctx, calls } = makeCtx({ rewind: () => Promise.resolve(plan(1)) });
+    const out = await runRemoteCommand({ kind: 'retry' }, ctx);
+    expect(calls).toContain('rewind:1');
+    expect(out.reply).toBe('');
+    expect(out.resend).toEqual({ text: '上次那句话' });
+  });
+
+  it('carries the dropped turn\'s images into the re-send', async () => {
+    const image = { id: 'img_1', mediaType: 'image/png' as const, bytes: 3, digest: 'abc', file: 'D:/s/img_1.png' };
+    const { ctx } = makeCtx({
+      rewind: () => Promise.resolve({ ...plan(1), prompt: { ...plan(1).prompt, images: [image] } }),
+    });
+    const out = await runRemoteCommand({ kind: 'retry' }, ctx);
+    expect(out.resend?.images).toEqual([image]);
+  });
+
+  it('advertises both verbs', async () => {
+    const help = (await runRemoteCommand({ kind: 'help' }, makeCtx().ctx)).reply;
+    expect(help).toContain('/undo');
+    expect(help).toContain('/retry');
+  });
+});
+
+describe('/usage', () => {
+  const PRICED: PricingTable = { 'model-a': { input: 1, output: 2 } };
+  const USED: UsageStats = {
+    turns: 12,
+    promptTokens: 1_000_000,
+    completionTokens: 500_000,
+    cachedTokens: 400_000,
+    missTokens: 0,
+    missTurns: 0,
+  };
+
+  it('turns the session totals into an estimate when the model is priced', async () => {
+    const { ctx } = makeCtx({ usage: USED, pricing: PRICED });
+    const reply = (await runRemoteCommand({ kind: 'usage' }, ctx)).reply;
+    expect(reply).toContain('model-a');
+    expect(reply).toContain('轮次：12');
+    // 1M prompt @ $1/M + 0.5M completion @ $2/M = $2.00
+    expect(reply).toContain('≈ $2.0000（输入 $1.0000 + 输出 $1.0000）');
+  });
+
+  it('groups thousands so a long-running session stays readable', async () => {
+    const { ctx } = makeCtx({
+      usage: zeroUsage({ promptTokens: 12_345_678, cachedTokens: 1_000_000, completionTokens: 987_654 }),
+      pricing: PRICED,
+    });
+    const reply = (await runRemoteCommand({ kind: 'usage' }, ctx)).reply;
+    expect(reply).toContain('输入：12,345,678 token（缓存命中 1,000,000）');
+    expect(reply).toContain('输出：987,654 token');
+  });
+
+  it('says the model is UNPRICED instead of printing $0.00', async () => {
+    // The failure this exists to prevent: a bare `$0.00` is indistinguishable from
+    // "free", and an operator reading their bill would draw the opposite
+    // conclusion from the truth.
+    const noTable = (await runRemoteCommand({ kind: 'usage' }, makeCtx({ usage: USED }).ctx)).reply;
+    expect(noTable).toContain('未配价');
+    expect(noTable).not.toContain('$0');
+
+    const unlisted = (await runRemoteCommand(
+      { kind: 'usage' },
+      makeCtx({ usage: USED, pricing: { 'other-model': { input: 1 } } }).ctx,
+    )).reply;
+    expect(unlisted).toContain('model-a 未配价');
+
+    // An entry with neither side filled in has nothing to price with either.
+    const empty = (await runRemoteCommand(
+      { kind: 'usage' },
+      makeCtx({ usage: USED, pricing: { 'model-a': {} } }).ctx,
+    )).reply;
+    expect(empty).toContain('未配价');
+  });
+
+  it('reports a LOWER BOUND when only one side is priced', async () => {
+    // Pricing only the input side must not read as "the output was free": the sum
+    // is a floor, and the line says so.
+    const { ctx } = makeCtx({ usage: USED, pricing: { 'model-a': { input: 1 } } });
+    const reply = (await runRemoteCommand({ kind: 'usage' }, ctx)).reply;
+    expect(reply).toContain('≥ $1.0000（输入 $1.0000；未配价的一侧未计入）');
+  });
+
+  it('admits when this process keeps no usage accounting', async () => {
+    const { ctx } = makeCtx({ noUsageSeat: true });
+    expect((await runRemoteCommand({ kind: 'usage' }, ctx)).reply).toContain('读不到本会话的用量');
+  });
+
+  it('shows the cache-miss line only when there IS a miss', async () => {
+    const quiet = (await runRemoteCommand({ kind: 'usage' }, makeCtx({ usage: USED, pricing: PRICED }).ctx)).reply;
+    expect(quiet).not.toContain('未命中缓存');
+
+    const wasting = (
+      await runRemoteCommand(
+        { kind: 'usage' },
+        makeCtx({ usage: zeroUsage({ promptTokens: 5000, missTokens: 2000, missTurns: 3 }), pricing: PRICED }).ctx,
+      )
+    ).reply;
+    expect(wasting).toContain('未命中缓存：2,000 token（按全价计，共 3 轮）');
+  });
+
+  it('never prints a nonzero amount as $0', async () => {
+    // A single cheap turn can land below a millionth of a dollar. `$0` there is a
+    // lie about a model that does cost money, so the floor is spelled as a bound.
+    const { ctx } = makeCtx({ usage: zeroUsage({ promptTokens: 1 }), pricing: { 'model-a': { input: 0.01 } } });
+    const reply = (await runRemoteCommand({ kind: 'usage' }, ctx)).reply;
+    expect(reply).toContain('<$0.000001');
+    expect(reply).not.toMatch(/≈ \$0\b/u);
+  });
+
+  it('keeps enough precision for a sub-cent amount to be worth reading', async () => {
+    const { ctx } = makeCtx({ usage: zeroUsage({ promptTokens: 100, completionTokens: 100 }), pricing: PRICED });
+    const reply = (await runRemoteCommand({ kind: 'usage' }, ctx)).reply;
+    expect(reply).toContain('≈ $0.0003（输入 $0.0001 + 输出 $0.0002）');
   });
 });
 

@@ -4,12 +4,12 @@
  * 这层存在的理由只有一条：**HTTP 状态码不是判据**。同一个开放平台，把「消息分片发送
  * 过快」以 HTTP 404 返回（业务码 50002 / err_code 40113004），把「系统繁忙，请稍后重
  * 试」以 HTTP 500 返回（50015001）。按状态码分类会同时犯两个错：把限频当永久失败
- * （于是平台抖一下，整轮的流式就被一次噪声废掉），又把真实的 4xx 当可重试（于是对着
+ * （于是平台抖一下，整轮就被一次噪声废掉），又把真实的 4xx 当可重试（于是对着
  * 一个永远不会成功的请求退避三轮）。所以判据是业务码，状态码只在响应里没有业务码时
  * 兜底。
  *
- * 第三类是「撤回过期」（40064004）：它不是故障，是**预期**——消息发出超过平台的两分
- * 钟时限后再撤，本来就会被拒。它既不该重试，也不该在日志里冒充需要人处理的告警。
+ * 两类就够了：可重试（含限频，等更久）与不可重试。原先还有第三类「撤回过期」
+ * （40064004），随撤回机制一起删掉了——不再撤回任何消息，也就没有「撤回得太晚」。
  */
 import { QqTimeoutError } from './deadline.js';
 
@@ -22,9 +22,6 @@ const RETRYABLE_CODES = new Set([
 
 /** 限频：重试要等得更久，因为平台要的是「慢一点」，不是「再试一次」。 */
 const RATE_LIMIT_CODES = new Set([50002, 40113004]);
-
-/** 撤回时限已过：预期结果，不是故障。 */
-const RECALL_EXPIRED_CODES = new Set([40064004]);
 
 /** 传输层失败（连接被断、超时、DNS）：与业务码无关，重试有意义。 */
 const TRANSPORT_CODES = new Set([
@@ -90,13 +87,6 @@ export function isRateLimited(err: unknown): boolean {
   if (!(err instanceof QqApiError)) return false;
   const code = err.businessCode;
   return code !== undefined && RATE_LIMIT_CODES.has(code);
-}
-
-/** 撤回时限已过：调用方据此安静收场，而不是打一条告警。 */
-export function isRecallExpired(err: unknown): boolean {
-  if (!(err instanceof QqApiError)) return false;
-  const code = err.businessCode;
-  return code !== undefined && RECALL_EXPIRED_CODES.has(code);
 }
 
 /** 响应体里取一个数字字段（非对象、缺字段、类型不对一律 undefined）。 */

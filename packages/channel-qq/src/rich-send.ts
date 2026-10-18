@@ -51,18 +51,46 @@ export interface RichSend {
 }
 
 /**
- * 卡片正文：行与行之间用零宽字符占位（官方给的换行写法）。
+ * 卡片正文：行与行之间用零宽字符占位。
  *
- * markdown 里裸换行会把每一行渲染成独立段落，段落间距就是读者看到的「多出来的
- * 空行」——卡片越短越显眼（四行状态卡下面再挂一排按钮时最明显）。零宽字符把整段
- * 收进同一个段落，行还是分开的，间距没有了。
+ * 官方 `换多行` 那一节的写法是**单独一行**的零宽字符——QQ 会把连续空行折叠掉，`\n\n`
+ * 只给一个空行，要更多就得插零宽字符行。这里是它的变体：把零宽字符挂在每行**行尾**
+ * （末行除外），让整段落进同一个段落、消掉行距。
+ *
+ * 两次实测（2026-10，QQ 手机端）记在这里，因为这是这块唯一的经验依据，而它并不支持
+ * 「零宽字符就是那个多出来的空行」这个最顺手的解释：
+ *
+ *  - 四行状态卡的行距是 25px，与纯文本气泡一致——这段确实紧贴，变体用法达到了目的；
+ *  - 但它的**首行之上**还多出正好一行的高度（39px vs 14px）；
+ *  - 那个多出来的空行只出现在挂了 keyboard 的卡片上：同内容的纯文本回落、单行 markdown
+ *    回复都没有。所以更可能是平台给「带按钮的 markdown 卡片」留的版式。
+ *
+ * 正文本身从不以换行开头（`lines.join('\n')` 与本函数都不会前置），所以它不是我们的文本
+ * 里的空行；而按钮只能挂在 markdown 消息上（纯文本 + keyboard 平台不渲染按钮），
+ * 躲开这张卡片就等于丢掉按钮。
  */
 export function cardText(lines: readonly string[]): string {
   return lines.map((line, i) => (i === lines.length - 1 ? line : `${line}\u200B`)).join('\n');
 }
 
-/** 官方 keyboard JSON：按钮动作用 `type` 区分（0 跳转、1 回调、2 指令）。 */
+/**
+ * 官方 keyboard JSON：按钮动作用 `type` 区分（0 跳转、1 回调、2 指令）。
+ *
+ * `permission` 是**必填**（官方表格 `msg-btn.md`：`action.permission.type` 必填，
+ * 0 指定用户可操作 / 1 仅管理者可操作 / 2 所有人可操作 / 3 指定身份组，3 仅频道）。
+ * 这里原先只在 `allowIds` 非空时才写它，于是 `/status` 那张卡整卡没有 `permission`，
+ * 点下去被平台判成无权访问——用户实测的原话就是「无权限访问」。所以**永远**写出来。
+ *
+ * 收紧时用 `type: 0` 而不是 `type: 2`：`type: 2` 的定义是「所有人可操作」，再带一个
+ * `specify_user_ids` 并不构成限制（两条语义互不相容，平台按 `type` 判），群里任何人
+ * 就都能点「允许」——而「一张群里所有人可见的卡，不该谁都能批」正是 `allowIds` 存在的
+ * 理由。单聊里没有第二个人，`type: 0` 与 `type: 2` 等效，所以这个选择两个场景都对。
+ *
+ * `unsupport_tips` 同为必填（客户端不支持该 action 时弹的 toast）。指令按钮回指它自己的
+ * `data`：手打那条命令与点按钮殊途同归，卡片正文里也是这么写的。
+ */
 function keyboardBody(keyboard: QqKeyboard, allowIds?: readonly string[]): unknown {
+  const ids = allowIds ?? [];
   return {
     content: {
       rows: keyboard.rows.map((row, r) => ({
@@ -71,16 +99,22 @@ function keyboardBody(keyboard: QqKeyboard, allowIds?: readonly string[]): unkno
           render_data: { label: button.label, visited_label: button.label, style: 0 },
           action: {
             type: button.kind === 'link' ? 0 : button.kind === 'callback' ? 1 : 2,
+            permission: ids.length > 0 ? { type: 0, specify_user_ids: [...ids] } : { type: 2 },
             data: button.data,
             ...(button.kind === 'command' ? { enter: true } : {}),
-            ...(allowIds !== undefined && allowIds.length > 0
-              ? { permission: { type: 2, specify_user_ids: [...allowIds] } }
-              : {}),
+            unsupport_tips: unsupportTips(button),
           },
         })),
       })),
     },
   };
+}
+
+/** 客户端不支持该 action 时弹的文案（官方必填字段）。 */
+function unsupportTips(button: QqButton): string {
+  if (button.kind === 'link') return '当前 QQ 版本不支持按钮跳转，请复制链接打开';
+  if (button.kind === 'callback') return '当前 QQ 版本不支持该按钮，请改用文字指令';
+  return `当前 QQ 版本不支持按钮，请直接回复 ${button.data}`;
 }
 
 export interface MessagePlan {

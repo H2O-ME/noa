@@ -5,7 +5,7 @@
  * (`outbox.ts`), which every outbound path shares — so what remains here is the
  * part that is genuinely this file's job: an empty answer is not a failed answer,
  * and a failure is a line in the log plus an honest `false` to the caller's
- * counter.
+ * counter. A delivered answer is also final: nothing is recalled afterwards.
  */
 import type { Peer } from './types.js';
 import type { RemoteAnswer } from './peers.js';

@@ -1,10 +1,11 @@
+import { isSafeHttpUrl } from '@noa/core';
 import { AccessTokenManager, QqApi, QqGateway, type CredentialSource, type FetchLike, type QqGatewayState, type RichSend, type SocketFactory } from './protocol.js';
 import { InboundHandler, type InboundHandlerOptions } from './inbound.js';
 import type { RemoteAnswer } from './peers.js';
 import type { ReplySink } from './reply.js';
 import { defaultSocketFactory } from './socket.js';
 import { withDeadline } from './deadline.js';
-import type { Peer, QqBotChannelStats } from './types.js';
+import type { Peer, QqBotChannelStats, TurnInput } from './types.js';
 
 /**
  * 把协议层装配成一个完整通道：WebSocket 事件 →（去重、被动窗口缓存）→
@@ -27,8 +28,14 @@ export interface QqBotChannelOptions {
    */
   appId: CredentialSource;
   clientSecret: CredentialSource;
-  /** 收到一条群/单聊消息，返回回复文本（运行方的 agent 大脑）。 */
-  brain: (text: string, peer: Peer) => Promise<RemoteAnswer>;
+  /**
+   * 收到一条群/单聊消息，返回回复文本（运行方的 agent 大脑）。
+   *
+   * The turn carries the message TEXT plus any IMAGES the operator attached —
+   * resolved to durable references by this channel before the call, so the brain
+   * receives something the kernel already knows how to send to a model.
+   */
+  brain: (turn: TurnInput, peer: Peer) => Promise<RemoteAnswer>;
   fetchFn?: FetchLike;
   socketFactory?: SocketFactory;
   /** 默认 GET https://api.sgroup.qq.com/gateway/bot 取 wss 地址。 */
@@ -50,6 +57,13 @@ export interface QqBotChannelOptions {
   remote?: InboundHandlerOptions['remote'];
   /** 新消息打断在跑的那一轮：见 `InboundHandlerOptions.interrupt`。 */
   interrupt?: InboundHandlerOptions['interrupt'];
+  /**
+   * 语音转写座位：入站语音附件 → 文字。缺省 = 未配置转写，语音降级为一句说明。
+   * 平台自带的 `asr_refer_text` 不走这里（免费、不用下载）。
+   */
+  transcribe?: InboundHandlerOptions['transcribe'];
+  /** 入站图片落盘所在的 home（测试用）；缺省 = 进程 home。 */
+  mediaHomedir?: string;
 }
 
 export interface QqBotChannel {
@@ -83,25 +97,13 @@ export interface QqBotChannel {
    * @param peerId - `group:<id>` / `c2c:<id>`。
    * @param content - 文本。
    * @param msgId - 被动回复的 msg_id（缺省 = 不带窗口）。
-   * @returns 每片消息的平台 id（撤回要用；媒体/分片各占一位）。
+   * @returns 每片消息的平台 id（媒体/分片各占一位）。
    */
   send(peerId: string, content: string, msgId?: string, rich?: RichSend): Promise<string[]>;
   /** 该对端被动回复窗口里的最近 msg_id（过期、或通道已停即 undefined）。 */
   lastMsgIdOf(peerId: string): string | undefined;
   /** 回应一次按钮互动（`PUT /interactions/{id}`）：3 秒内，一次性。 */
   interact(interactionId: string): Promise<void>;
-  /**
-   * 单聊流式消息的一片（`POST /v2/users/{openid}/stream_messages`）：nova 只服务
-   * 私聊，群聊没有对应接口。首片 `streamMsgId` 缺省，由服务端在响应 `id` 里发回；
-   * 调用方（`ReplyStreamer`）负责节流与收口。
-   * @returns 服务端回的 `stream_msg_id`（首片才有意义）。
-   */
-  stream(peerId: string, text: string, state: 1 | 10, index: number, streamMsgId?: string): Promise<string | undefined>;
-  /**
-   * 撤回一条自己发的单聊消息（平台时限 2 分钟）：尽力而为，失败静默——撤回
-   * 永远只是清扫，绝不能反过来打扰投递。
-   */
-  recall(peerId: string, messageId: string): Promise<void>;
 }
 
 /** 设置页要的那一份连接读数（`QqBotChannel.reading`）：计数口径是**本次运行**。 */
@@ -142,9 +144,26 @@ export function createQqBotChannel(options: QqBotChannelOptions): QqBotChannel {
     // per-message allowance are shared with every other outbound path.
     reply: options.reply,
     log,
+    // Authenticated media fetch for inbound images: the QQ CDN returns non-200
+    // without the `QQBot <token>` header, and an unsafe URL is refused before a
+    // byte leaves the machine.
+    fetchMedia: async (url) => {
+      if (!isSafeHttpUrl(url)) {
+        throw new Error(`qqbot: refusing media from an unsafe URL (${url.slice(0, 80)})`);
+      }
+      const accessToken = await token.get();
+      return await withDeadline(async (signal) => {
+        const res = await fetchFn(url, { headers: { Authorization: `QQBot ${accessToken}` }, signal });
+        if (!res.ok) throw new Error(`media download failed (${res.status})`);
+        if (res.bytes === undefined) throw new Error('media download unsupported by this transport');
+        return await res.bytes();
+      }, 'media download');
+    },
     ...(options.remote !== undefined ? { remote: options.remote } : {}),
     interact: (interactionId) => api.respondInteraction(interactionId),
     ...(options.interrupt !== undefined ? { interrupt: options.interrupt } : {}),
+    ...(options.transcribe !== undefined ? { transcribe: options.transcribe } : {}),
+    ...(options.mediaHomedir !== undefined ? { mediaHomedir: options.mediaHomedir } : {}),
   });
 
   const send = async (peerId: string, content: string, msgId?: string, rich?: RichSend): Promise<string[]> => {
@@ -179,31 +198,6 @@ export function createQqBotChannel(options: QqBotChannelOptions): QqBotChannel {
     return sent.map((m) => m.id);
   };
 
-  // 流式一片：nova 只服务私聊，群聊没有对应接口（群聊对话在装配层就不该出现）。
-  const stream = async (peerId: string, text: string, state: 1 | 10, index: number, streamMsgId?: string): Promise<string | undefined> => {
-    const [kind, openid] = [peerId.slice(0, peerId.indexOf(':')), peerId.slice(peerId.indexOf(':') + 1)];
-    if (kind !== 'c2c') throw new Error(`qqbot: streaming is c2c-only (got peer "${kind}:…")`);
-    const msgId = inbound.msgIdOf(peerId);
-    const res = await api.sendStreamC2C(openid, {
-      text,
-      mode: 'replace',
-      state,
-      index,
-      // markdown：流式卡片就是正式回复的那张脸，纯 text 会把富文本原样吐字。
-      contentType: 'markdown',
-      ...(streamMsgId !== undefined ? { streamMsgId } : {}),
-      ...(msgId !== undefined ? { msgId } : {}),
-      msgSeq: api.drawSeq(msgId ?? `stream-${peerId}`),
-    });
-    return res.streamMsgId;
-  };
-
-  const recall = async (peerId: string, messageId: string): Promise<void> => {
-    const [kind, openid] = [peerId.slice(0, peerId.indexOf(':')), peerId.slice(peerId.indexOf(':') + 1)];
-    if (kind !== 'c2c') return;
-    await api.deleteC2CMessage(openid, messageId);
-  };
-
   const interact = async (interactionId: string): Promise<void> => {
     await api.respondInteraction(interactionId);
   };
@@ -226,8 +220,6 @@ export function createQqBotChannel(options: QqBotChannelOptions): QqBotChannel {
   return {
     api,
     send,
-    stream,
-    recall,
     lastMsgIdOf: (peerId) => inbound.msgIdOf(peerId),
     interact,
     reading: async () => ({ ...inbound.stats(), ...(started ? { botName: await api.botName() } : {}) }),
@@ -240,13 +232,9 @@ export function createQqBotChannel(options: QqBotChannelOptions): QqBotChannel {
       }
       if (started) return;
       started = true;
-      try {
-        await gateway.connect();
-      } catch (err) {
-        // 连不上就让下一次（比如改完凭据再保存）还能重试，而不是永久卡在「已启动」。
-        started = false;
-        throw err;
-      }
+      // `begin()` 而不是 `connect()`：首次拨号失败不是「启动失败」，而是交给网关
+      // 自己的退避重连继续拨。否则一次瞬时的 DNS/TLS 抖动就会让通道永久静默。
+      await gateway.begin();
     },
     stop: () => {
       if (stopped) return;

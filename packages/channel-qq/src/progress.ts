@@ -6,16 +6,17 @@
  * indistinguishable from one that hung, and a long agent run can spend minutes in
  * tools before it has anything to say.
  *
- * So progress is forwarded — but it is BUDGETED, because the platform is not a
- * stream:
+ * So progress is forwarded — but it is BUDGETED, because every outbound message is
+ * a scarce resource here:
  *
- *  - an outbound message here is a PASSIVE REPLY, tied to one inbound `msg_id` and
+ *  - an outbound message is a PASSIVE REPLY, tied to one inbound `msg_id` and
  *    answered with an incrementing `msg_seq`. The platform bounds how many replies
- *    one inbound message may draw, so a per-token stream would spend the whole
- *    allowance in the first second and then fail — losing exactly the final answer
- *    the operator was waiting for.
- *  - therefore: a bounded number of COALESCED updates, and a guarantee that the
- *    last one is always the answer.
+ *    one inbound message may draw, so one message per tool call would spend the
+ *    whole allowance early in the run and then fail — losing exactly the final
+ *    answer the operator was waiting for.
+ *  - therefore: a bounded number of COALESCED updates. The ANSWER does not travel
+ *    through this relay at all — `peers.ts` returns it to the channel's reply
+ *    seat, which spends the reserve this budget deliberately leaves untouched.
  *
  * Narration is driven by TOOL CALLS and by the model's MID-RUN text, and there
  * is no receipt. A turn that answers
@@ -38,8 +39,8 @@ const TOOLS_PER_LINE = 6;
 /**
  * 一轮跑完却没有一句要说的文本时，对端听到的那句兜底话。
  *
- * 单独导出：调用方（`peers.ts`）判到「无文本可回」时得自己把这句话送出去——那时
- * 叙述继电器已经随观察者活在别处，兜底文案仍必须只有一份。
+ * 单独导出：`peers.ts` 判到「无文本可回」时把它**当作这一轮的答案返回**（走答案的
+ * 配额与「落地后才清扫」的顺序），兜底文案因此必须只有一份，不能在这里再写一遍。
  */
 export const EMPTY_TURN_LINE = '（本轮没有要说的文本，工作已完成。）';
 
@@ -100,8 +101,11 @@ export class ProgressRelay {
    * The model's interstitial narration ("已完成分析，开始抓正文") is the part a
    * phone reader actually wants — tool NAMES alone say that something runs, not
    * what was concluded. It rides the SAME budget as the tool lines: same
-   * interval, same per-turn cap, and the final answer is deduped against what
-   * went out here (a text already narrated must not arrive again as the reply).
+   * interval, same per-turn cap.
+   *
+   * 答案不走这里，所以「同一句话既当叙述又当答案」不是靠去重躲开的：模型若把最后
+   * 那句原话提前说过一遍，两处都会发出，而且**两条都留着**——没有撤回机制（见
+   * `outbox.ts`），读者看过的消息就一直在那里。
    */
   text(body: string): void {
     const trimmed = body.trim();
@@ -117,43 +121,56 @@ export class ProgressRelay {
   }
 
   /**
-   * The turn is over. Always reported: the answer is what was asked for, so it is
-   * never dropped for budget's sake — an update no longer fits, the answer still
-   * goes, and what is dropped is the narration.
+   * The turn is over. Nothing to do: the ANSWER does not travel through here.
+   *
+   * 这里曾经有一个 `final(text)`，它想保证「最后一条一定是答案」，还带一份与已叙述
+   * 文本去重的逻辑。它从来没有被接线过（`git log -S 'relay.final'` 在本仓库里没有
+   * 任何一条命中），而它想保证的那件事现在由答案那条路自己保证：正文由 `peers.ts`
+   * **返回**给通道的回复座位（花的是为答案留的配额），落地之后才清扫过程碎片。
+   * 留着一个没人调的 `final` 只会让「答案怎么送达」有两种说法。
    */
-  final(text: string): void {
-    const body = text.trim();
-    if (body.length === 0) {
-      // Silence is a legitimate outcome (a turn that only ran tools), but the peer
-      // must never be left with NO reply at all: this line is the floor, and it
-      // fires whether or not narration went out first.
-      this.emit(EMPTY_TURN_LINE);
-      return;
-    }
-    // Already narrated mid-run: sending it again would read as the model
-    // repeating itself. What was flushed IS the answer.
-    if (body === this.lastEmitted) return;
-    this.emit(body);
-  }
 
   /** Flush buffered narration if the interval has passed and budget remains. */
   private flush(): void {
     if (!this.dirty) return;
     if (this.updatesSent >= this.maxUpdates) return;
     if (this.now() - this.lastSentAt < this.minIntervalMs) return;
-    this.dirty = false;
-    this.updatesSent += 1;
-    this.lastSentAt = this.now();
     // Mid-run TEXT outranks tool names: it says what was CONCLUDED, which is
     // what the reader is waiting for. Names still buffered ride the next flush.
     if (this.pendingText !== undefined) {
       const text = this.pendingText;
       this.pendingText = undefined;
-      this.emit(text);
+      this.spend(text);
       return;
     }
     const tools = this.pendingTools.splice(0, this.pendingTools.length);
-    this.emit(describeTools(tools));
+    if (tools.length === 0) {
+      this.dirty = false;
+      return;
+    }
+    const line = describeTools(tools);
+    if (line === this.lastEmitted) {
+      // 同一句话不连发第二遍。实测：一次「你对我有什么记忆」连调两次 recall，聊天里
+      // 出现两条一模一样的「正在：recall」—— 读者学不到任何东西，却要多收一条消息、
+      // 多花一格叙述额度。工具名相同就是同一句话（`describeTools` 是纯函数），所以
+      // 这层去重是精确的，不是「看起来像就丢」。额度与时间戳都不动，那一格留给真正
+      // 有话说的时候。
+      this.dirty = false;
+      return;
+    }
+    this.spend(line);
+  }
+
+  /**
+   * One update out, paying for it: the budget and the interval both move.
+   *
+   * 只有真正说出**新东西**才走到这里（见 `flush` 的重复判定）。
+   */
+  private spend(text: string): void {
+    this.updatesSent += 1;
+    this.lastSentAt = this.now();
+    this.dirty = false;
+    this.emit(text);
   }
 
   /** One line out, with any transport failure absorbed (see the class comment). */

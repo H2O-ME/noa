@@ -11,14 +11,25 @@
  *    rather than become an unauthorized proactive message that the platform
  *    throttles or rejects.
  *  - **how many times** one inbound message may be answered. This is the scarce
- *    resource: the platform bounds replies per `msg_id`, and a per-token stream
- *    would spend the whole allowance before the agent had anything to say.
+ *    resource: the platform bounds replies per `msg_id`, and one message per tool
+ *    call would spend the whole allowance before the agent had anything to say.
  *  - **who wins** when the allowance runs out. The conclusion is what was asked
  *    for; narration is what may be dropped — so narration is capped BELOW the
- *    allowance, keeping a reply's worth in reserve.
+ *    allowance, keeping a reply's worth in reserve. An approval or question card
+ *    is neither: the turn is stopped on it, so it outranks narration (see
+ *    `NoticeKind`) while still respecting the same reserve.
  *
  * The ledger is therefore keyed by `msg_id` and shared by every caller, which is
  * the only way those three answers can be consistent with each other.
+ *
+ * **Nothing here is ever recalled.** The platform offers a two-minute recall and
+ * this outbox used to spend it: narration went out during a turn and was taken back
+ * once the answer landed, so the transcript kept the conclusion and not the
+ * scaffolding. That reads as messages vanishing on their own — the hardest thing to
+ * explain to someone holding a phone — and it deletes the only record the peer has
+ * when the answer's own send then fails. Hermes Agent's QQ adapter never recalls
+ * anything; what it does for "still working" is the platform's typing indicator,
+ * which is not a message at all. So here: a sent message is final.
  *
  * The per-window allowance is a deliberate guess: the platform documents a limit
  * but the exact number is not verifiable from here (no credentials, no live
@@ -26,7 +37,6 @@
  * failure mode when it is wrong is a dropped narration line rather than a lost
  * answer.
  */
-import { isRecallExpired } from './api-error.js';
 import { bareImageUrl, type RichSend } from './protocol.js';
 
 /** How many messages one inbound `msg_id` may draw in total. */
@@ -38,8 +48,22 @@ export const WINDOW_ALLOWANCE = 5;
  */
 export const NARRATION_ALLOWANCE = 3;
 
-/** 平台的撤回时限（2 分钟）再收紧一点：边界上送出去的消息不值得赌。 */
-const RECALL_WINDOW_MS = 100_000;
+/**
+ * What one outbound notice IS — and therefore who wins when the budget is short.
+ *
+ *  - `narration`: progress lines and receipts. Droppable by design; a peer who
+ *    loses one has lost a "still working" line and nothing else.
+ *  - `interaction`: a card the turn is BLOCKED on (an approval, a question). It
+ *    must not compete with narration for the narration cap, because progress can
+ *    spend that whole cap before the card is even built — `PROGRESS_MAX_UPDATES`
+ *    and `NARRATION_ALLOWANCE` are both 3, so every turn that touches three tools
+ *    starved its own approval card. Observed live: the card was refused, nothing
+ *    was logged, no button ever appeared in the chat, and the approval died on its
+ *    three-minute timer reporting "the peer did not answer" — a peer who was never
+ *    asked. An interaction still spends from the WINDOW ledger, because the
+ *    platform's own bound is the one that cannot be exceeded.
+ */
+export type NoticeKind = 'narration' | 'interaction';
 
 
 /** What one send attempt ended as. */
@@ -50,12 +74,10 @@ export interface OutboxResult {
 }
 
 export interface QqOutboxOptions {
-  /** The transport: `msgId` is the passive window the send answers. Returns the sent message ids (for recall). */
+  /** The transport: `msgId` is the passive window the send answers. */
   send: (peerId: string, content: string, msgId?: string, rich?: RichSend) => Promise<string[]>;
   /** The live passive window for one peer, if any. */
   lastMsgIdOf: (peerId: string) => string | undefined;
-  /** The recall transport (c2c `DELETE`); absent = narration is never swept. */
-  recall?: (peerId: string, messageId: string) => Promise<void>;
   /**
    * 本地媒体识别：内容里出现真实存在的本地图片/视频/语音路径时给出候选。
    * 由持有 fs 的一侧注入（本模块不做 IO）。
@@ -76,23 +98,15 @@ interface WindowLedger {
 export class QqOutbox {
   private readonly send: QqOutboxOptions['send'];
   private readonly lastMsgIdOf: QqOutboxOptions['lastMsgIdOf'];
-  private readonly recall: QqOutboxOptions['recall'];
   private readonly localMedia: QqOutboxOptions['localMedia'];
   private readonly log: (line: string) => void;
   private readonly windowAllowance: number;
   private readonly narrationAllowance: number;
   private readonly ledgers = new Map<string, WindowLedger>();
-  /**
-   * Narration messages that may still be swept: once the ANSWER lands, the
-   * progress fragments that led to it are noise. Keyed by peer, dropped after
-   * the platform's recall window (~2 min) has certainly passed.
-   */
-  private readonly recallable = new Map<string, { id: string; at: number }[]>();
 
   constructor(options: QqOutboxOptions) {
     this.send = options.send;
     this.lastMsgIdOf = options.lastMsgIdOf;
-    this.recall = options.recall;
     this.localMedia = options.localMedia;
     this.log = options.log ?? (() => undefined);
     this.windowAllowance = options.windowAllowance ?? WINDOW_ALLOWANCE;
@@ -100,61 +114,46 @@ export class QqOutbox {
   }
 
   /**
-   * Narration: a receipt, a progress line, an approval notice.
+   * Narration: a receipt, a progress line, a timeout notice. Or, with
+   * `kind: 'interaction'`, a card the turn is waiting on (see `NoticeKind`).
    *
-   * Refused (and logged) once the narration allowance is spent, so the reply's
+   * Refused (and logged) once that class's allowance is spent, so the reply's
    * reserve survives. Never throws, never awaits: this runs inside a turn's event
    * loop, and a chat that cannot be reached must not fail the work it describes.
    * @param peerId - `group:<id>` / `c2c:<id>`.
    * @param content - the text.
-   * @returns whether it went out.
+   * @param rich - markdown/keyboard payload, when the message has one.
+   * @param kind - narration (droppable) or interaction (the turn is blocked on it).
+   * @returns whether it went out. Callers that are BLOCKED on the message must
+   * read this — a card nobody received is a run parked on a question never asked.
    */
-  narrate(peerId: string, content: string, rich?: RichSend): OutboxResult {
+  narrate(peerId: string, content: string, rich?: RichSend, kind: NoticeKind = 'narration'): OutboxResult {
     const window = this.lastMsgIdOf(peerId);
     if (window === undefined) return { ok: false, reason: 'no live passive-reply window for this peer' };
     const ledger = this.ledgerFor(window, peerId);
-    if (ledger.used >= this.narrationAllowance) {
-      return { ok: false, reason: `narration allowance spent for this message (${this.narrationAllowance})` };
+    const allowance = this.allowanceFor(kind);
+    if (ledger.used >= allowance) {
+      return { ok: false, reason: `${kind} allowance spent for this message (${allowance})` };
     }
     ledger.used += 1;
-    const sentAt = Date.now();
-    void this.dispatch(peerId, content, window, rich)
-      .then((ids) => {
-        const list = this.recallable.get(peerId) ?? [];
-        for (const id of ids) {
-          if (id.length > 0) list.push({ id, at: sentAt });
-        }
-        // Bounded: each entry lives at most one recall window past its send.
-        this.recallable.set(peerId, list.filter((entry) => sentAt - entry.at < RECALL_WINDOW_MS));
-      })
-      .catch((err: unknown) => {
-        this.log(`qqbot: narration send failed for ${peerId}: ${String(err)}`);
-      });
+    // 即发即忘，而且**发出之后就不再碰它**：没有撤回，所以既不需要记住消息 id，也
+    // 不需要世代来分辨「这条是答案之前还是之后落地的」。读者看过的消息就留在那里。
+    void this.dispatch(peerId, content, window, rich).catch((err: unknown) => {
+      this.log(`qqbot: ${kind} send failed for ${peerId}: ${String(err)}`);
+    });
     return { ok: true };
   }
 
   /**
-   * 撤回这个对端**所有还没过平台时限的叙述消息**（进度碎片、已完结的审批卡）。
-   * 正式回复落地后调用：过程线说完该消失，转录里留下答案而不是脚手架。
-   * 尽力而为：单条失败只丢日志，绝不打扰其余的清扫。
+   * How much one class may spend in this window.
+   *
+   * Both leave the reply its slot — that is the invariant, not the numbers. They
+   * differ in how much slack they take: narration is droppable and is kept to the
+   * lower cap, while an interaction may spend everything but the reply's slot,
+   * because refusing a card costs the run its whole turn.
    */
-  drainRecallable(peerId: string): void {
-    const list = this.recallable.get(peerId);
-    this.recallable.delete(peerId);
-    if (list === undefined || this.recall === undefined) return;
-    const now = Date.now();
-    for (const entry of list) {
-      // 时限按**发出时刻**算，而一轮可以跑好几分钟：不在这里按年龄过一遍，就会拿
-      // 几分钟前的消息去撤，换回一条必然的「已经超出消息撤回时限」。插入时筛过一次
-      // 不顶用——那次是以**新条目**的时刻算的，挡不住「这之后就再没发过消息」。
-      if (now - entry.at >= RECALL_WINDOW_MS) continue;
-      void this.recall(peerId, entry.id).catch((err: unknown) => {
-        // 时限已过是预期结果（本地时钟与平台时钟不可能完全对齐），不是要人处理的
-        // 故障：它不该在日志里冒充告警。
-        if (isRecallExpired(err)) return;
-        this.log(`qqbot: recall failed for ${peerId}: ${String(err)}`);
-      });
-    }
+  private allowanceFor(kind: NoticeKind): number {
+    return kind === 'interaction' ? this.windowAllowance - 1 : this.narrationAllowance;
   }
 
   /**

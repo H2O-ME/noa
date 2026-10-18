@@ -26,6 +26,32 @@ import type { PeerNotifier } from './peers.js';
 export const REMOTE_QUESTION_TIMEOUT_MS = 10 * 60_000;
 
 /**
+ * One ask's send-and-fallback inputs, so the lifecycle below reads as one story.
+ *
+ * The wording lives here (at the call site that knows what the ask is about) and
+ * the timing, bookkeeping and teardown live in `ask` — that split is the point:
+ * two asks that each own their own timer is how one of them ends up waiting
+ * forever.
+ */
+interface PendingAskSpec {
+  peer: Peer;
+  /** 推出去的那条（审批/提问卡片）。 */
+  text: string;
+  rich?: RichSend;
+  timeoutMs: number;
+  /**
+   * 没人答复时怎么收敛（审批=拒绝，提问=取消）。`why` 让理由如实：这个理由会进工具
+   * 结果、被模型转述给读者，而「卡片没发出去」不是对端的错。
+   */
+  settle: (why: 'timeout' | 'undelivered', reason?: string) => void;
+  /**
+   * 收敛之后对读者说的那句话。`why` 区分「等够了」与「压根没问出去」——后者不是
+   * 对端的错，不该写成超时。
+   */
+  note: (why: 'timeout' | 'undelivered', reason?: string) => string;
+}
+
+/**
  * One outstanding ask, from "sent to QQ" to "answered, cancelled or timed out".
  *
  * Keyed by the kernel's request id, which is what the answer comes back with.
@@ -33,8 +59,6 @@ export const REMOTE_QUESTION_TIMEOUT_MS = 10 * 60_000;
 export class PendingAsks {
   /** Each peer's UNANSWERED ask timer (the kernel serializes asks per session). */
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** The ask behind each id, so `/approve` and `/answer` can name what they settle. */
-  private readonly pending = new Map<string, { peer: Peer; settle: () => void }>();
 
   constructor(private readonly notify: PeerNotifier = () => undefined) {}
 
@@ -68,12 +92,29 @@ export class PendingAsks {
       },
       ...(peer.actorId.length > 0 ? { allowIds: [peer.actorId] } : {}),
     };
-    this.ask(request.id, peer, lines.join('\n'), REMOTE_APPROVAL_TIMEOUT_MS, () => {
-      // `resolveApproval` returns false for a settled id, so the fallback is a
-      // harmless duplicate attempt rather than a second decision.
-      agent.resolveApproval(request.id, { answer: 'deny', reason: 'QQ 对端超时未答复，按拒绝处理' });
-      this.notify(peer, `审批超时（${Math.round(REMOTE_APPROVAL_TIMEOUT_MS / 1000)} 秒未回复），已按拒绝处理：${request.call.name}`);
-    }, rich);
+    const seconds = Math.round(REMOTE_APPROVAL_TIMEOUT_MS / 1000);
+    this.ask(request.id, {
+      peer,
+      text: lines.join('\n'),
+      rich,
+      timeoutMs: REMOTE_APPROVAL_TIMEOUT_MS,
+      settle: (why, reason) => {
+        // `resolveApproval` returns false for a settled id, so the fallback is a
+        // harmless duplicate attempt rather than a second decision. The REASON
+        // matters as much as the verdict: it rides into the tool result the model
+        // reads, and "the peer timed out" is a lie when the card never went out —
+        // the model repeated exactly that back to the peer.
+        agent.resolveApproval(request.id, {
+          answer: 'deny',
+          reason: why === 'timeout'
+            ? 'QQ 对端超时未答复，按拒绝处理'
+            : `审批卡没能发到聊天里（${reason ?? '未知原因'}），这一轮没有等到答复`,
+        });
+      },
+      note: (why, reason) => (why === 'timeout'
+        ? `审批超时（${seconds} 秒未回复），已按拒绝处理：${request.call.name}`
+        : `审批卡没能发到聊天里（${reason ?? '未知原因'}），这一轮没有等你答复，已按拒绝处理：${request.call.name}`),
+    });
   }
 
   /**
@@ -102,15 +143,17 @@ export class PendingAsks {
       ...(keyboard !== undefined ? { keyboard } : {}),
       ...(peer.actorId.length > 0 ? { allowIds: [peer.actorId] } : {}),
     };
-    this.ask(request.id, peer, body, REMOTE_QUESTION_TIMEOUT_MS, () => {
-      agent.cancelQuestion(request.id);
-      this.notify(peer, `提问超时（${Math.round(REMOTE_QUESTION_TIMEOUT_MS / 60_000)} 分钟未回复），已取消。`);
-    }, rich);
-  }
-
-  /** The ask behind one id, when it is still outstanding (used for the reply text). */
-  outstanding(id: string): { peer: Peer } | undefined {
-    return this.pending.get(id);
+    const minutes = Math.round(REMOTE_QUESTION_TIMEOUT_MS / 60_000);
+    this.ask(request.id, {
+      peer,
+      text: body,
+      rich,
+      timeoutMs: REMOTE_QUESTION_TIMEOUT_MS,
+      settle: () => { agent.cancelQuestion(request.id); },
+      note: (why, reason) => (why === 'timeout'
+        ? `提问超时（${minutes} 分钟未回复），已取消。`
+        : `提问卡没能发到聊天里（${reason ?? '未知原因'}），已直接取消。`),
+    });
   }
 
   /** The ask has a verdict: stand the fallback down. */
@@ -118,7 +161,6 @@ export class PendingAsks {
     const timer = this.timers.get(id);
     if (timer !== undefined) clearTimeout(timer);
     this.timers.delete(id);
-    this.pending.delete(id);
   }
 
   /**
@@ -132,16 +174,27 @@ export class PendingAsks {
   dispose(): void {
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
-    this.pending.clear();
   }
 
-  /** Send one ask and arm its timer. The one place the lifecycle is expressed. */
-  private ask(id: string, peer: Peer, text: string, timeoutMs: number, onTimeout: () => void, rich?: RichSend): void {
-    this.notify(peer, text, rich);
-    this.pending.set(id, { peer, settle: onTimeout });
+  /**
+   * Send one ask and arm its timer. The one place the lifecycle is expressed.
+   *
+   * A card that did NOT go out settles immediately instead of arming the timer:
+   * the timer exists to bound how long a peer may take to answer, and a peer who
+   * was never asked has nothing to answer. Waiting anyway costs the run its whole
+   * turn and then reports a timeout the peer cannot make sense of.
+   */
+  private ask(id: string, spec: PendingAskSpec): void {
+    const pushed = this.notify(spec.peer, spec.text, spec.rich, 'interaction');
+    if (pushed !== undefined && !pushed.ok) {
+      this.notify(spec.peer, spec.note('undelivered', pushed.reason));
+      spec.settle('undelivered', pushed.reason);
+      return;
+    }
     this.timers.set(id, setTimeout(() => {
       this.settled(id);
-      onTimeout();
-    }, timeoutMs));
+      spec.settle('timeout');
+      this.notify(spec.peer, spec.note('timeout'));
+    }, spec.timeoutMs));
   }
 }

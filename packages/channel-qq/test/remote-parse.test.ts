@@ -6,7 +6,7 @@
  * 操作者的话悄悄吞掉是比「没听懂」严重得多的失败。
  */
 import { describe, expect, it } from 'vitest';
-import { parseRemoteCommand } from '../src/remote-parse.js';
+import { parseRemoteCommand, remoteBypassesQueue } from '../src/remote-parse.js';
 
 /** 这条输入被认成了什么指令（不是指令则返回「prompt」）。 */
 function kindOf(text: string): string {
@@ -23,9 +23,29 @@ describe('remote command parsing', () => {
     expect(parseRemoteCommand('/ws D:/work')).toEqual({ command: { kind: 'workspace', dir: 'D:/work' } });
     expect(parseRemoteCommand('/new')).toEqual({ command: { kind: 'new' } });
     expect(parseRemoteCommand('/status')).toEqual({ command: { kind: 'status' } });
+    expect(parseRemoteCommand('/usage')).toEqual({ command: { kind: 'usage' } });
+    expect(parseRemoteCommand('/undo')).toEqual({ command: { kind: 'undo', turns: 1 } });
+    expect(parseRemoteCommand('/undo 3')).toEqual({ command: { kind: 'undo', turns: 3 } });
+    expect(parseRemoteCommand('/retry')).toEqual({ command: { kind: 'retry' } });
     expect(parseRemoteCommand('/help')).toEqual({ command: { kind: 'help' } });
     expect(parseRemoteCommand('/approve')).toEqual({ command: { kind: 'approve', allow: true } });
     expect(parseRemoteCommand('/deny')).toEqual({ command: { kind: 'approve', allow: false } });
+  });
+
+  it('reads `/model default <id>` as switch-and-persist', () => {
+    // 与裸 `/model <id>` 的区别是它**同时**改这个部署的默认（写回 config.json），所以
+    // 解析层必须把这件事标出来：调用方据此决定要不要落盘。
+    expect(parseRemoteCommand('/model default deepseek-v4-flash')).toEqual({
+      command: { kind: 'model', model: 'deepseek-v4-flash', persist: true },
+    });
+    // 带空格或斜杠的 id 是合法 id（聚合站常见 `vendor/model`），要整段留下。
+    expect(parseRemoteCommand('/model default nebius/Qwen3-Embedding-8B')).toEqual({
+      command: { kind: 'model', model: 'nebius/Qwen3-Embedding-8B', persist: true },
+    });
+    // 裸 `/model` 是「有哪些」，不是「切到名为 default 的模型」。
+    expect(parseRemoteCommand('/model')).toEqual({ command: { kind: 'models' } });
+    // 光一个 `default` 没有 id：那是指令没写全，不是要切到一个叫 default 的模型。
+    expect(parseRemoteCommand('/model default')).toEqual({ command: { kind: 'models' } });
   });
 
   it('sends every unrecognized line through as a prompt, verbatim', () => {
@@ -59,9 +79,26 @@ describe('remote command parsing', () => {
     expect(parseRemoteCommand('/perm')).toEqual({ text: '/perm' });
   });
 
+  it('refuses a bogus turn count as a prompt, never as a silent "one"', () => {
+    // Reading `/undo 0` or `/undo -1` as "undo one" would take back a turn the
+    // peer did not ask for — the same failure mode as a silent no-op, with worse
+    // consequences.
+    for (const text of ['/undo 0', '/undo -1', '/undo abc', '/undo 2.5', '/undo 1 2']) {
+      expect(parseRemoteCommand(text)).toEqual({ text });
+    }
+  });
+
+  it('queues the surface-mutating verbs, and only the unblocking ones bypass', () => {
+    // An undo spliced in beside a live turn would take back a turn the running
+    // request is still building from, so it belongs in the serial queue.
+    expect(remoteBypassesQueue({ kind: 'undo', turns: 1 })).toBe(false);
+    expect(remoteBypassesQueue({ kind: 'retry' })).toBe(false);
+    expect(remoteBypassesQueue({ kind: 'stop' })).toBe(true);
+  });
+
   it('reads a command with trailing spaces and an inline argument', () => {
     // A phone keyboard appends spaces; an argument may contain spaces (a path).
-    expect(parseRemoteCommand('  /perm   auto-edit  ')).toEqual({ command: { kind: 'perm', mode: 'auto-edit' } });
+    expect(parseRemoteCommand('  /perm   auto  ')).toEqual({ command: { kind: 'perm', mode: 'auto' } });
     expect(parseRemoteCommand('/ws C:/Program Files/x')).toEqual({
       command: { kind: 'workspace', dir: 'C:/Program Files/x' },
     });

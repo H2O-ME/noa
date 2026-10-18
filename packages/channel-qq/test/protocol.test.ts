@@ -81,6 +81,31 @@ describe('QqApi', () => {
     expect((bodies[0]!['content'] as string).length).toBe(4500);
   });
 
+  it('forgets a msg_id once its passive window is over, instead of keeping one entry per message', async () => {
+    // 账本只为「同一个 msg_id 的多次回复」而存在，而那个窗口最长 55 分钟（单聊）。
+    // 没有这道闸门时它是常驻进程里唯一只涨不落的表：每个入站消息长一条，永不清理。
+    vi.useFakeTimers();
+    try {
+      const bodies: Array<Record<string, unknown>> = [];
+      const token = new AccessTokenManager('app', 'secret', async () => jsonResponse(200, { access_token: 't', expires_in: 7200 }));
+      const api = new QqApi(token, async (_url, init) => {
+        bodies.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>);
+        return jsonResponse(200, { id: `msg-${bodies.length}` });
+      });
+
+      await api.sendC2CMessage('U1', { content: 'a', msgId: 'old' });
+      await api.sendC2CMessage('U1', { content: 'a', msgId: 'old' });
+      expect(bodies.map((b) => b['msg_seq'])).toEqual([1, 2]);
+
+      // 窗口过完：这个 msg_id 已经死了（再回它就是被平台拒），账本不该继续为它留位置。
+      vi.setSystemTime(Date.now() + 61 * 60_000);
+      await api.sendC2CMessage('U1', { content: 'a', msgId: 'old' });
+      expect(bodies[2]!['msg_seq']).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('invalidates the token on 401 and surfaces the error', async () => {
     let tokenCalls = 0;
     const token = new AccessTokenManager('app', 'secret', async () => {
