@@ -47,8 +47,51 @@ export class ProviderProtocolError extends Error {
  */
 export const RETRY_BACKOFF_MAX_MS = 32_000;
 
+/**
+ * How long to wait for a 429 that came with NO `retry-after`.
+ *
+ * The exponential backoff is built for transient blips: it tops out at
+ * {@link RETRY_BACKOFF_MAX_MS}, and its whole budget is spent inside ten seconds.
+ * A rate-limit rejection is not a blip — it is a quota with a window, and
+ * re-asking inside that window cannot succeed. Observed live: the gateway
+ * answered `429 {"message":"rpm exhausted"}` with no hint, the client spent four
+ * attempts in about seven seconds, and the turn died telling the operator to try
+ * again later.
+ *
+ * A minute is the window the common quotas are counted over (`rpm` is literally
+ * requests-per-minute). It is a guess, so it is bounded by
+ * {@link DEFAULT_MAX_RATE_LIMIT_WAITS} — and a server that DOES send
+ * `retry-after` is still believed instead (see `parseRetryAfterMs`).
+ */
+export const RATE_LIMIT_WINDOW_MS = 60_000;
+
+/**
+ * How many times one request may sit out a full {@link RATE_LIMIT_WINDOW_MS}.
+ *
+ * Bounded because the wait is OUR guess, not the server's instruction, and
+ * because the run is holding a chat peer's reply window open while it waits
+ * (a QQ group window is minutes, not hours). Two windows is long enough to
+ * outlast a per-minute quota and short enough to still answer within one.
+ */
+export const DEFAULT_MAX_RATE_LIMIT_WAITS = 2;
+
 export function isRetryableStatus(status: number): boolean {
   return status === 429 || (status >= 500 && status <= 599);
+}
+
+/**
+ * A rate-limit rejection the server gave us NO delay hint for.
+ *
+ * The distinction is what decides how long to wait: a 429 with `retry-after`
+ * names its own delay and is honored as given, while a bare one only says
+ * "quota", and the window has to come from {@link RATE_LIMIT_WINDOW_MS}.
+ *
+ * Only the status is read. The body of a rejection is prose the operator can
+ * change at will (`rpm exhausted`, a Chinese sentence, a JSON error object), so
+ * matching on it would break the moment the gateway rewords it.
+ */
+export function isUnhintedRateLimit(err: unknown): boolean {
+  return err instanceof HttpError && err.status === 429 && err.retryAfterMs === undefined;
 }
 
 /**

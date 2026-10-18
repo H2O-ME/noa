@@ -1,7 +1,7 @@
 import type { StreamEvent } from '@noa/core';
 import { describe, expect, it, vi } from 'vitest';
 import { OpenAICompatClient } from '../src/client.js';
-import { RETRY_BACKOFF_MAX_MS, parseRetryAfterMs } from '../src/retry.js';
+import { RATE_LIMIT_WINDOW_MS, RETRY_BACKOFF_MAX_MS, parseRetryAfterMs } from '../src/retry.js';
 
 const SSE_BODY = [
   'data: {"choices":[{"delta":{"content":"Hi"},"index":0}]}',
@@ -48,6 +48,10 @@ function clientWith(fetchImpl: typeof fetch): OpenAICompatClient {
     model: 'test-model',
     fetchImpl,
     retryBaseDelayMs: 1,
+    // No full-window waits here: these tests are about the ATTEMPT budget, and a
+    // bare 429 (no `retry-after`) would otherwise park each one for a minute of
+    // real time. The window itself is pinned by its own test below.
+    maxRateLimitWaits: 0,
   });
 }
 
@@ -72,6 +76,8 @@ function failoverClient(
     fallbacks: [fallback],
     fetchImpl,
     retryBaseDelayMs: 1,
+    /** See `clientWith`: budget tests must not pay the quota window. */
+    maxRateLimitWaits: 0,
   });
 }
 
@@ -218,6 +224,74 @@ describe('OpenAICompatClient', () => {
     const events = await drain(client.stream({ messages: [] }));
     expect(calls).toBe(2);
     expect(events).toEqual([]);
+  });
+
+  it('waits out a whole quota window for a 429 that outlived the cheap backoff', async () => {
+    // Observed live: the gateway answered `429 {"message":"rpm exhausted"}` with no
+    // `retry-after`, the client spent its whole attempt budget in about seven
+    // seconds of exponential backoff, and the turn died telling the operator to
+    // try again later. A per-minute quota cannot be cleared by seven seconds of
+    // patience, so the second failure in a streak sits out a full window.
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const fetchImpl: typeof fetch = () => {
+        calls += 1;
+        if (calls <= 2) return Promise.resolve(new Response(null, { status: 429 }));
+        return Promise.resolve(sseResponse('data: [DONE]\n\n'));
+      };
+      const client = new OpenAICompatClient({
+        baseURL: 'https://example.test/v1',
+        apiKey: 'sk-test',
+        model: 'test-model',
+        fetchImpl,
+        retryBaseDelayMs: 1,
+        maxRateLimitWaits: 1,
+      });
+      const done = drain(client.stream({ messages: [] }));
+
+      // Attempt 0 → the cheap backoff, not the window.
+      await vi.advanceTimersByTimeAsync(10);
+      expect(calls).toBe(2);
+      // Attempt 1 → now the full window, and nothing goes out during it.
+      await vi.advanceTimersByTimeAsync(RATE_LIMIT_WINDOW_MS - 1_000);
+      expect(calls).toBe(2);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await done;
+      expect(calls).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives up rather than waiting more windows than configured', async () => {
+    vi.useFakeTimers();
+    try {
+      const calls: number[] = [];
+      const fetchImpl: typeof fetch = () => {
+        calls.push(1);
+        return Promise.resolve(new Response(null, { status: 429 }));
+      };
+      const client = new OpenAICompatClient({
+        baseURL: 'https://example.test/v1',
+        apiKey: 'sk-test',
+        model: 'test-model',
+        fetchImpl,
+        retryBaseDelayMs: 1,
+        maxRateLimitWaits: 1,
+        maxRetries: 5,
+      });
+      const done = drain(client.stream({ messages: [] })).catch((err: unknown) => err);
+      await vi.advanceTimersByTimeAsync(RATE_LIMIT_WINDOW_MS * 5);
+      const err = await done;
+      expect(err).toBeInstanceOf(Error);
+      // The guess is bounded: 6 attempts would have been the budget, but only the
+      // first one gets the cheap backoff and only one gets the window, so the
+      // whole thing stops after the third failure instead of waiting forever.
+      expect(calls).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('throws HttpError on a terminal 400', async () => {
@@ -417,7 +491,27 @@ describe('endpoint fallback', () => {
     expect(events.some((e) => e.type === 'text_delta' && e.text === 'served')).toBe(true);
   });
 
-  it('switches to the fallback after the retry budget is spent (a rate-limited primary)', async () => {
+  it('switches to the fallback after the retry budget is spent', async () => {
+    const rec = byUrl({
+      [PRIMARY]: () => new Response(null, { status: 503 }),
+      [BACKUP]: ok,
+    });
+    const client = failoverClient(rec.impl);
+    const events = await drain(client.stream({ messages: [] }));
+
+    // A 503 IS worth retrying, so the same host gets the whole budget first — it
+    // is the most likely place for the next attempt to succeed.
+    expect(rec.calls.filter((u) => u === PRIMARY)).toHaveLength(4); // 1 + maxRetries(3)
+    expect(rec.calls.at(-1)).toBe(BACKUP);
+    expect(events.some((e) => e.type === 'text_delta' && e.text === 'served')).toBe(true);
+  });
+
+  it('hands a rate-limited primary over to the fallback once its window budget is spent', async () => {
+    // A bare 429 is not the same kind of failure as a 503: the attempt budget
+    // would be spent on backoff that cannot outlast a per-minute quota. With no
+    // window waits allowed, the handover happens as soon as the second failure
+    // proves the cheap answer did not work — and the fallback is a different
+    // host, so it may well not be throttled at all.
     const rec = byUrl({
       [PRIMARY]: () => new Response(null, { status: 429 }),
       [BACKUP]: ok,
@@ -425,9 +519,7 @@ describe('endpoint fallback', () => {
     const client = failoverClient(rec.impl);
     const events = await drain(client.stream({ messages: [] }));
 
-    // A 429 IS worth retrying, so the same host gets the whole budget first —
-    // it is the most likely place for the next attempt to succeed.
-    expect(rec.calls.filter((u) => u === PRIMARY)).toHaveLength(4); // 1 + maxRetries(3)
+    expect(rec.calls.filter((u) => u === PRIMARY)).toHaveLength(2);
     expect(rec.calls.at(-1)).toBe(BACKUP);
     expect(events.some((e) => e.type === 'text_delta' && e.text === 'served')).toBe(true);
   });

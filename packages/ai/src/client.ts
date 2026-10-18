@@ -22,13 +22,16 @@
  */
 import type { ChatProvider, ChatRequest, StreamEvent, ToolDefinition } from '@noa/core';
 import {
+  DEFAULT_MAX_RATE_LIMIT_WAITS,
   HttpError,
   ProviderProtocolError,
+  RATE_LIMIT_WINDOW_MS,
   RETRY_BACKOFF_MAX_MS,
   abortError,
   errMessage,
   isAbortError,
   isRetryableError,
+  isUnhintedRateLimit,
   parseRetryAfterMs,
   sleep,
 } from './retry.js';
@@ -69,6 +72,11 @@ export interface OpenAICompatConfig {
   maxRetries?: number;
   /** Base delay for exponential backoff in ms. Default 500. */
   retryBaseDelayMs?: number;
+  /**
+   * How many times ONE request may sit out a full rate-limit window when a 429
+   * arrives with no `retry-after` (see `RATE_LIMIT_WINDOW_MS`). Default 2.
+   */
+  maxRateLimitWaits?: number;
   timeoutMs?: number;
   temperature?: number;
   /** Passed through as `max_tokens` when set. */
@@ -122,6 +130,7 @@ export class OpenAICompatClient implements ChatProvider {
   private readonly fetchImpl: typeof fetch;
   private readonly maxRetries: number;
   private readonly retryBaseDelayMs: number;
+  private readonly maxRateLimitWaits: number;
   private readonly timeoutMs: number;
   private readonly fallbacks: readonly ProviderFallback[];
   /** Epoch ms until which later requests try the fallbacks before the primary. */
@@ -142,6 +151,7 @@ export class OpenAICompatClient implements ChatProvider {
     this.fetchImpl = config.fetchImpl ?? fetch;
     this.maxRetries = config.maxRetries ?? 3;
     this.retryBaseDelayMs = config.retryBaseDelayMs ?? 500;
+    this.maxRateLimitWaits = config.maxRateLimitWaits ?? DEFAULT_MAX_RATE_LIMIT_WAITS;
     this.timeoutMs = config.timeoutMs ?? 120_000;
     // A fallback that repeats the primary is not a fallback: it would spend the
     // same failing address twice and report the failure as if it had tried
@@ -295,6 +305,10 @@ export class OpenAICompatClient implements ChatProvider {
   private async *streamVia(target: RequestTarget, req: ChatRequest): AsyncGenerator<StreamEvent> {
     const body = this.buildBody(req, target);
     let lastError: unknown;
+    // Counted separately from `attempt`: a rate-limit window is a long wait of
+    // OUR making, and it must be bounded by its own budget rather than by how
+    // many cheap backoff retries happen to be left.
+    let rateLimitWaits = 0;
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       if (req.signal?.aborted) throw abortError();
@@ -373,10 +387,55 @@ export class OpenAICompatClient implements ChatProvider {
             error: errMessage(err),
           };
         }
-        const retryAfterMs = err instanceof HttpError ? err.retryAfterMs : undefined;
-        await sleep(retryAfterMs ?? this.backoffDelay(attempt), req.signal);
+        const pause = this.pauseBeforeRetry(err, attempt, rateLimitWaits);
+        if (pause === undefined) {
+          throw lastError instanceof Error ? lastError : new Error(String(lastError));
+        }
+        if (pause.quotaWindow) rateLimitWaits += 1;
+        await sleep(pause.ms, req.signal);
       }
     }
+  }
+
+  /**
+   * How long to hold off before the next attempt — or undefined to stop trying.
+   *
+   * Three answers, in the order the failure taxonomy ranks them:
+   *
+   *  - a server-supplied `retry-after` wins outright (it is an instruction);
+   *  - a BARE 429 (quota, no hint) sits out a whole {@link RATE_LIMIT_WINDOW_MS}
+   *    once the cheap backoff has already failed inside this streak. The backoff
+   *    tops out at ten seconds of patience, which lands inside the same window and
+   *    fails again; observed live, the gateway answered `429 {"message":"rpm
+   *    exhausted"}`, the client spent its whole budget in about seven seconds, and
+   *    the turn died reporting a transient-sounding error;
+   *  - everything else takes the exponential backoff.
+   *
+   * `attempt > 0` is the refinement that keeps the long wait honest: the FIRST
+   * failure in a streak still gets the cheap answer, because a burst limit clears
+   * in well under a second and parking a chat peer's turn for a minute to discover
+   * that would be its own failure.
+   *
+   * undefined means the quota-window budget is spent. That is a real stop, not a
+   * fallback to more backoff: the guess was ours, and the number of minutes a
+   * waiting peer is asked to accept has to be bounded.
+   * @param err - the failure that just happened.
+   * @param attempt - zero-based attempt index within this endpoint's budget.
+   * @param waitsSoFar - quota windows already sat out in this request.
+   * @returns the pause, or undefined to give up.
+   */
+  private pauseBeforeRetry(
+    err: unknown,
+    attempt: number,
+    waitsSoFar: number,
+  ): { ms: number; quotaWindow: boolean } | undefined {
+    const retryAfterMs = err instanceof HttpError ? err.retryAfterMs : undefined;
+    if (retryAfterMs !== undefined) return { ms: retryAfterMs, quotaWindow: false };
+    if (!isUnhintedRateLimit(err) || attempt === 0) {
+      return { ms: this.backoffDelay(attempt), quotaWindow: false };
+    }
+    if (waitsSoFar >= this.maxRateLimitWaits) return undefined;
+    return { ms: RATE_LIMIT_WINDOW_MS, quotaWindow: true };
   }
 
   /**
