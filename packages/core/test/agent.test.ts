@@ -270,6 +270,9 @@ describe('runAgent', () => {
       expect(events.at(-1)?.type).toBe('done');
       const toolResult = messages.find((m): m is ToolResultMessage => m.role === 'tool');
       expect(toolResult?.content).toContain('aborted by user interrupt');
+      // 而且必须**如实**：这个工具根本不看信号，它并没有停下。只报「已中止」会让读者
+      // 以为副作用结束了。
+      expect(toolResult?.content).toContain('may still be running');
       expect(messages.at(-1)?.role).toBe('user');
     } finally {
       clearTimeout(timer);

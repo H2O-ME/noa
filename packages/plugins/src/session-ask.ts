@@ -10,6 +10,8 @@
  */
 import {
   ApprovalBroker,
+  DEFAULT_APPROVAL_WAIT_MS,
+  DEFAULT_QUESTION_WAIT_MS,
   QuestionBroker,
   type AgentSession,
   type ApprovalAudit,
@@ -81,6 +83,15 @@ export function makeSessionAskWiring(p: {
    * behaviour (every non-auto-allowed call goes straight to the human).
    */
   reviewer?: CallReviewer;
+  /**
+   * 人类等待的兜底上限，秒表在**内核**这一层（见 core 的
+   * `DEFAULT_APPROVAL_WAIT_MS` / `DEFAULT_QUESTION_WAIT_MS`）。
+   *
+   * 缺省即内核默认值，而那已经是「比任何自带超时的 surface 都宽」的兜底：通道自己在
+   * 3 分钟（审批）与 10 分钟（提问）就把事情了结了，这里只在没人管的时候生效。要更紧
+   * 的装配（一个交互式界面自己知道人能等多久）可以在这里钉死。
+   */
+  askTimeouts?: { approvalMs?: number; questionMs?: number };
 }): { bridge: ApprovalBroker; questions: QuestionBroker; permission: PermissionService } {
   const findTool = (call: ToolCall): ToolDefinition | undefined =>
     p.tools().find((tool) => tool.name === call.name);
@@ -98,10 +109,16 @@ export function makeSessionAskWiring(p: {
         return [];
       }
     },
+    // 兜底等待上限：内核默认值是给「没有任何人管」的 surface 用的保险，通道那层更紧。
+    p.askTimeouts?.approvalMs ?? DEFAULT_APPROVAL_WAIT_MS,
   );
   const asker = p.reviewer === undefined ? bridge.asker : reviewFirst(p.reviewer, bridge.asker, p.rootDir);
   const permission = new PermissionService(p.approval, asker, p.audit, p.policyCell);
-  return { bridge, questions: new QuestionBroker(), permission };
+  return {
+    bridge,
+    questions: new QuestionBroker(p.askTimeouts?.questionMs ?? DEFAULT_QUESTION_WAIT_MS),
+    permission,
+  };
 }
 
 /**
@@ -120,6 +137,7 @@ export function makeKernelAskWiring(p: {
   policyCell: ApprovalPolicyCell;
   audit: (entry: ApprovalAudit) => void;
   reviewer?: CallReviewer;
+  askTimeouts?: { approvalMs?: number; questionMs?: number };
 }): { bridge: ApprovalBroker; questions: QuestionBroker; permission: PermissionService } {
   return makeSessionAskWiring(p);
 }

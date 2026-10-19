@@ -8,7 +8,7 @@
  * question outstanding — each of these must fail closed rather than settle a
  * wait with something no human said.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   MAX_CUSTOM_ANSWER_CHARS,
   MAX_OPTION_LABEL_CHARS,
@@ -297,5 +297,55 @@ describe('deriveUserQuestions — "does this surface have a person"', () => {
     // A surface that explicitly says it cannot answer must not be resurrected by
     // the interactive default.
     expect(deriveUserQuestions({ answersQuestions: false, interactive: true })).toBe(false);
+  });
+});
+
+/**
+ * 兜底等待：与审批同一条理由（见 `DEFAULT_QUESTION_WAIT_MS`），但收场方式不同——
+ * 提问的失败方向是**取消**，而且理由必须是「没有人答」而不是「用户取消了」：后者会
+ * 被模型如实转述成一个从没发生过的决定。
+ */
+describe('QuestionBroker · backstop wait', () => {
+  it('cancels a question nobody answers, with a code that is not ASK_CANCELLED', async () => {
+    vi.useFakeTimers();
+    try {
+      const resolutions: QuestionResolution[] = [];
+      const broker = new QuestionBroker(5_000);
+      broker.attach(
+        () => undefined,
+        (_id, resolution) => resolutions.push(resolution),
+      );
+
+      const pending = broker.asker(QUESTIONS);
+      const expectation = expect(pending).rejects.toMatchObject({ code: 'ASK_TIMEOUT' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expectation;
+
+      expect(resolutions).toEqual([{ source: 'timeout' }]);
+      expect(broker.outstanding()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stands the backstop down once the human answers', async () => {
+    vi.useFakeTimers();
+    try {
+      const resolutions: QuestionResolution[] = [];
+      const broker = new QuestionBroker(5_000);
+      broker.attach(
+        (request) => {
+          broker.resolve(request.id, { answers: [{ id: 'q1', selected: ['Fast'] }] });
+        },
+        (_id, resolution) => resolutions.push(resolution),
+      );
+
+      await expect(broker.asker(QUESTIONS)).resolves.toEqual({ answers: [{ id: 'q1', selected: ['Fast'] }] });
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(resolutions).toHaveLength(1);
+      expect(resolutions[0]?.source).toBe('user');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

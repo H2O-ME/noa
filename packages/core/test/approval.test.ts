@@ -1,6 +1,16 @@
-import { describe, expect, it } from 'vitest';
-import { MAX_ALWAYS_SCOPE_WORDS, MAX_DENY_REASON_CHARS, parseAskResult } from '../src/approval.js';
+import { describe, expect, it, vi } from 'vitest';
+import {
+  ApprovalBroker,
+  MAX_ALWAYS_SCOPE_WORDS,
+  MAX_DENY_REASON_CHARS,
+  parseAskResult,
+  type ApprovalResolution,
+} from '../src/approval.js';
+import type { ToolCall } from '../src/types.js';
 import { hasControlChars } from '../src/text.js';
+
+/** One execute call — the only kind that ever reaches an approval ask. */
+const CALL: ToolCall = { id: 'c1', name: 'bash', args: { command: 'rm -rf /' }, rawArgs: '{}' };
 
 /**
  * The answer parser is the kernel's one untrusted-input boundary for approval:
@@ -75,5 +85,79 @@ describe('hasControlChars', () => {
     // A path or an id is never multi-line.
     expect(hasControlChars('one\ntwo')).toBe(true);
     expect(hasControlChars('one\ttwo')).toBe(true);
+  });
+});
+/**
+ * 兜底等待：**沉默必须有个尽头**。
+ *
+ * 审批的失败方向是拒绝（fail-closed），但「拒绝」要有一个定时器把它落下来才会发生。
+ * 原先那个定时器只存在于通道层（`channel-qq` 的 3 分钟），内核自己的契约是「等人类，
+ * 等到天荒地老」——任何别的 surface 只要忘了自带一个，那一轮就永久停在那里。
+ */
+describe('ApprovalBroker · backstop wait', () => {
+  it('denies an ask nobody answers, and reports it as a timeout rather than a user verdict', async () => {
+    vi.useFakeTimers();
+    try {
+      const resolutions: ApprovalResolution[] = [];
+      const broker = new ApprovalBroker(() => undefined, undefined, 5_000);
+      broker.attach(
+        () => undefined,
+        (_id, resolution) => resolutions.push(resolution),
+      );
+
+      const pending = broker.asker(CALL, 'execute');
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      const answer = await pending;
+      expect(answer).toMatchObject({ answer: 'deny' });
+      // 理由必须进工具结果：模型读到的要是「没等到答复」，不是一句没有来由的拒绝。
+      expect((answer as { reason?: string }).reason).toContain('按拒绝处理');
+      expect(resolutions).toEqual([{ source: 'timeout' }]);
+      expect(broker.outstanding()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stands the backstop down once the human answers', async () => {
+    vi.useFakeTimers();
+    try {
+      const resolutions: ApprovalResolution[] = [];
+      const broker = new ApprovalBroker(() => undefined, undefined, 5_000);
+      broker.attach(
+        (request) => {
+          broker.resolve(request.id, 'allow');
+        },
+        (_id, resolution) => resolutions.push(resolution),
+      );
+
+      await expect(broker.asker(CALL, 'execute')).resolves.toBe('allow');
+      // 定时器必须被清掉：留着它会在五分钟后把一条早已结束的审批再收敛一次
+      // ——第二次「结论」落到一个已经不在等的调用上。
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(resolutions).toEqual([{ source: 'user', answer: 'allow' }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('arms nothing when the assembly pinned no backstop', async () => {
+    // `0` 表示「装配方自己保证会收敛」（一个交互式界面自己知道人能等多久）。
+    vi.useFakeTimers();
+    try {
+      const resolutions: ApprovalResolution[] = [];
+      const broker = new ApprovalBroker(() => undefined, undefined, 0);
+      broker.attach(
+        () => undefined,
+        (_id, resolution) => resolutions.push(resolution),
+      );
+      const pending = broker.asker(CALL, 'execute');
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(resolutions).toEqual([]);
+      broker.failAll('aborted');
+      await expect(pending).resolves.toBe('deny');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

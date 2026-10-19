@@ -81,7 +81,12 @@ export type QuestionResolution =
   /** The run was interrupted while the question was outstanding. */
   | { source: 'aborted' }
   /** The session closed with the question outstanding (terminal). */
-  | { source: 'closed' };
+  | { source: 'closed' }
+  /**
+   * 没人答复，等到了内核的兜底上限（见 {@link DEFAULT_QUESTION_WAIT_MS}）。与
+   * `cancelled` 分开：那一条是**人按了取消**，这一条是**没有人出现过**。
+   */
+  | { source: 'timeout' };
 
 /** The ask seam: somebody with a human answers, or fails. */
 export type AskQuestionsFn = (
@@ -116,7 +121,8 @@ export type UserQuestionErrorCode =
   | 'NO_PROVIDER'
   | 'ASK_ABORTED'
   | 'ASK_CANCELLED'
-  | 'ASK_UNDELIVERED';
+  | 'ASK_UNDELIVERED'
+  | 'ASK_TIMEOUT';
 
 /**
  * The model-facing failure text, one string per code. Exported so the tool, the
@@ -135,6 +141,10 @@ export const USER_QUESTION_ERRORS: Record<UserQuestionErrorCode, string> = {
   // the same way and costs the peer a second silent round.
   ASK_UNDELIVERED:
     'ask_user_question never reached the user, so nobody was asked — do not retry it; say so in your reply instead',
+  // 与 `ASK_UNDELIVERED` 不同，这一条里卡片**可能确实送到过**，只是等到上限也没有人答。
+  // 所以它既不能读成「用户拒绝了」（没有人表态），也不能读成「你没问到人」。
+  ASK_TIMEOUT:
+    'nobody answered ask_user_question before the wait limit, so it was cancelled — say so plainly rather than assuming an answer',
 };
 
 /** A typed ask failure: the code is what callers branch on, the message is for the model. */
@@ -251,21 +261,39 @@ interface Waiter {
 }
 
 /**
+ * 内核兜底的提问等待上限。
+ *
+ * 与 `approval.ts` 的 `DEFAULT_APPROVAL_WAIT_MS` 同一条理由：**沉默必须有个尽头**。
+ * 提问的失败方向是取消（fail-closed），但「取消」原先只有通道层的 10 分钟定时器会落
+ * 下来，内核自己没有任何上限——一个不带超时的 surface 会让这一轮永久停在这里。
+ *
+ * 比审批那档更宽，因为回答一个问题本来就是慢事；它是兜底不是策略。
+ */
+export const DEFAULT_QUESTION_WAIT_MS = 30 * 60_000;
+
+/**
  * Request/response bridge between the model's ask and whichever surface holds a
  * human: the asker publishes a `QuestionRequest`, the surface answers by id, and
  * every outstanding wait ends — including the fail-closed ends (a dismissal, an
- * aborted run, a closed session) which reject with a typed error instead of
- * hanging or fabricating an answer.
+ * aborted run, a closed session, the wait limit) which reject with a typed error
+ * instead of hanging or fabricating an answer.
  *
  * Serialization is NOT here: the tool that asks is registered without
  * `isConcurrencySafe`, so the loop already runs one ask at a time.
  */
 export class QuestionBroker {
   private readonly waiters = new Map<string, Waiter>();
+  /** 每个未决提问的兜底定时器（见 `DEFAULT_QUESTION_WAIT_MS`）。 */
+  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Installed by the owning AgentSession; called for live surfaces only. */
   private publish: ((request: QuestionRequest) => void) | undefined;
   private resolved: ((id: string, resolution: QuestionResolution) => void) | undefined;
   private closed = false;
+
+  constructor(
+    /** 兜底等待上限；`0` 或非有限值表示不设兜底（装配方自己保证会收敛）。 */
+    private readonly waitMs: number = DEFAULT_QUESTION_WAIT_MS,
+  ) {}
 
   /** Attach the event-stream ends (see `AgentSession`'s constructor). */
   attach(
@@ -318,6 +346,10 @@ export class QuestionBroker {
         waiter.release = () => { signal.removeEventListener('abort', onAbort); };
       }
       this.waiters.set(request.id, waiter);
+      // 兜底定时器在**发布之前**就位：发布可能同步应答（脚本化的客户端、同 tick 的
+      // 通道），那之后 `retire` 会把它清掉；先应答后布置则会留下一个已经无人可取消的
+      // 定时器，在半小时后把一条早已结束的提问再取消一次。
+      this.armWait(request.id);
       try {
         this.publish?.(request);
       } catch (err) {
@@ -326,6 +358,19 @@ export class QuestionBroker {
       }
     });
   };
+
+  /** 布置一次兜底等待；`waitMs` 非正或非有限时不布置（调用方自己负责收敛）。 */
+  private armWait(id: string): void {
+    if (!(this.waitMs > 0) || !Number.isFinite(this.waitMs)) return;
+    this.timers.set(
+      id,
+      setTimeout(() => {
+        // 走与「人按了取消」同一条收敛路径，但带的是 `ASK_TIMEOUT`：读者必须能分清
+        // 「没有人出现过」和「有人拒绝了」。
+        this.failOne(id, new UserQuestionError('ASK_TIMEOUT'), { source: 'timeout' });
+      }, this.waitMs),
+    );
+  }
 
   /** Answer one outstanding request; false for unknown ids or an invalid answer. */
   resolve(id: string, answer: AskUserQuestionAnswer): boolean {
@@ -394,6 +439,9 @@ export class QuestionBroker {
   }
 
   private retire(id: string): void {
+    const timer = this.timers.get(id);
+    if (timer !== undefined) clearTimeout(timer);
+    this.timers.delete(id);
     this.waiters.get(id)?.release?.();
     this.waiters.delete(id);
   }

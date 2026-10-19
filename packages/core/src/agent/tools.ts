@@ -346,8 +346,17 @@ async function executeTool(
    * signal (user interrupt) cuts it off. The grace lets a tool that finishes
    * right around the abort record its real result; one that ignores its
    * cancellation signal gets cut off, so Esc/Ctrl+C always ends the run
-   * promptly (codex interrupt guarantee). The abandoned run keeps going in
-   * the background; its value is dropped.
+   * promptly (codex interrupt guarantee).
+   *
+   * WHAT ACTUALLY STOPS, and what only stops being WAITED for: every built-in
+   * that holds a process or a worker honours `ctx.signal` (bash kills the whole
+   * process tree, search aborts its worker, web aborts the fetch, run_code
+   * terminates its worker, subagent aborts the nested run). So for those, the
+   * interrupt is real. For a tool that ignores the signal — a third-party
+   * plugin, a synchronous loop — the abandoned run keeps going in the
+   * background and its value is dropped. The result text says so rather than
+   * reporting a stop that did not happen: a reader told "aborted" would believe
+   * the side effects ended.
    */
   return new Promise<string>((resolve) => {
     let settled = false;
@@ -366,7 +375,9 @@ async function executeTool(
         ? undefined
         : () => {
             abortGrace ??= setTimeout(
-              () => settle(`Error: tool "${call.name}" aborted by user interrupt`),
+              () => settle(
+                `Error: tool "${call.name}" aborted by user interrupt (it did not stop within ${ABORT_GRACE_MS}ms; work that ignores the signal may still be running)`,
+              ),
               ABORT_GRACE_MS,
             );
           };

@@ -217,7 +217,26 @@ export interface ApprovalRequest {
 export type ApprovalResolution =
   | { source: 'user'; answer: AskResult }
   | { source: 'aborted' }
-  | { source: 'closed' };
+  | { source: 'closed' }
+  /**
+   * 没人答复，等到了内核的兜底上限（见 {@link DEFAULT_APPROVAL_WAIT_MS}），按拒绝收敛。
+   * 与 `'user'` 分开是必须的：答复是人的决定，这一条是**没有人做过决定**。
+   */
+  | { source: 'timeout' };
+
+/**
+ * 内核兜底的审批等待上限。
+ *
+ * 存在的理由只有一条：**沉默必须有个尽头**。审批的失败方向是拒绝（fail-closed），但
+ * 「拒绝」只有在某个定时器把它落下来时才发生——原先那个定时器只存在于通道层
+ * （`channel-qq` 的 3 分钟），于是内核自己的契约是「等人类，等到天荒地老」。任何别的
+ * surface 只要忘了自带一个，那一轮就永久停在那里：工具不返回、run 不结束、日志停在
+ * 半截，而且没有任何一行说明为什么。
+ *
+ * 它是**兜底**不是策略：故意比任何自带超时的 surface 都宽（通道 3 分钟），只在没人管
+ * 的时候生效。装配方要更紧，就传自己的值。
+ */
+export const DEFAULT_APPROVAL_WAIT_MS = 10 * 60_000;
 
 /**
  * Request/response bridge between the permission engine's `ask` seam and the
@@ -232,6 +251,8 @@ export type ApprovalResolution =
 export class ApprovalBroker {
   private readonly pending = new Map<string, (r: AskResult) => void>();
   private readonly requests = new Map<string, ApprovalRequest>();
+  /** 每个未决审批的兜底定时器（见 `DEFAULT_APPROVAL_WAIT_MS`）。 */
+  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Installed by the owning AgentSession; called for live surfaces only. */
   private publish: ((request: ApprovalRequest) => void) | undefined;
   private resolved: ((id: string, resolution: ApprovalResolution) => void) | undefined;
@@ -240,6 +261,8 @@ export class ApprovalBroker {
   constructor(
     private readonly viewFor: (call: ToolCall) => ToolCallView | undefined,
     private readonly previewFor?: (call: ToolCall, kind: ToolPermissionKind) => Promise<string[]>,
+    /** 兜底等待上限；`0` 或非有限值表示不设兜底（装配方自己保证会收敛）。 */
+    private readonly waitMs: number = DEFAULT_APPROVAL_WAIT_MS,
   ) {}
 
   attach(
@@ -290,10 +313,15 @@ export class ApprovalBroker {
     return new Promise<AskResult>((resolve) => {
       this.pending.set(request.id, resolve);
       this.requests.set(request.id, request);
+      // 兜底定时器在**发布之前**就位：发布可能同步应答（脚本化的客户端、同 tick 的
+      // 通道），那之后 `resolve` 会把它清掉；先应答后布置则会留下一个已经无人可拒的
+      // 定时器，在十分钟后把一条早已结束的审批再收敛一次。
+      this.armWait(request.id);
       try {
         this.publish?.(request);
       } catch (err) {
         // A throwing publisher must not strand the ask either (fail closed).
+        this.clearWait(request.id);
         this.pending.delete(request.id);
         this.requests.delete(request.id);
         resolve('deny');
@@ -302,10 +330,45 @@ export class ApprovalBroker {
     });
   };
 
+  /** 布置一次兜底等待；`waitMs` 非正或非有限时不布置（调用方自己负责收敛）。 */
+  private armWait(id: string): void {
+    if (!(this.waitMs > 0) || !Number.isFinite(this.waitMs)) return;
+    this.timers.set(
+      id,
+      setTimeout(() => {
+        this.timeout(id);
+      }, this.waitMs),
+    );
+  }
+
+  private clearWait(id: string): void {
+    const timer = this.timers.get(id);
+    if (timer !== undefined) clearTimeout(timer);
+    this.timers.delete(id);
+  }
+
+  /**
+   * 等到了上限：按拒绝收敛，并把「没有人答复」如实报出去。
+   *
+   * 理由要带进工具结果（和通道那条超时路径一样）：模型读到的必须是「没等到答复」，
+   * 而不是一句没有来由的拒绝。
+   */
+  private timeout(id: string): void {
+    const settle = this.pending.get(id);
+    if (settle === undefined) return;
+    this.clearWait(id);
+    this.pending.delete(id);
+    this.requests.delete(id);
+    const minutes = Math.round(this.waitMs / 60_000);
+    settle({ answer: 'deny', reason: `等待人工审批超过 ${minutes} 分钟仍无答复，已按拒绝处理` });
+    this.resolved?.(id, { source: 'timeout' });
+  }
+
   /** Answer one outstanding request. Unknown/closed ids return false. */
   resolve(id: string, answer: AskResult): boolean {
     const settle = this.pending.get(id);
     if (settle === undefined) return false;
+    this.clearWait(id);
     this.pending.delete(id);
     this.requests.delete(id);
     settle(answer);
@@ -326,6 +389,7 @@ export class ApprovalBroker {
     const ids = [...this.requests.keys()];
     this.requests.clear();
     for (const id of ids) {
+      this.clearWait(id);
       this.resolved?.(id, { source: reason });
     }
   }
