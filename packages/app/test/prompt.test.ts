@@ -39,10 +39,13 @@ describe('buildNoaSystemPrompt', () => {
     const conditional = NOA_TOOLS.slice(at);
 
     // 条件注册的：只能在第二节出现。
-    for (const name of ['run_code', 'subagent', 'skill', 'switch_workspace', 'memory', 'recall', 'create_goal', 'update_goal']) {
+    // `switch_workspace` 刻意不在这份名单里：这个产品不传 `workspace.onChange`，所以它
+    // 永远不注册——列在这里只是一条点不亮的按钮。真实现状由 `tool-roster.test.ts` 钉住。
+    for (const name of ['run_code', 'subagent', 'skill', 'memory', 'recall', 'create_goal', 'update_goal']) {
       expect(conditional).toContain(name);
       expect(available).not.toContain(name);
     }
+    expect(NOA_TOOLS).not.toContain('switch_workspace');
     // 无条件注册的：第一节必须点名，否则模型不知道该优先用哪个。
     for (const name of ['read_file', 'list_dir', 'search_files', 'write_file', 'edit_file', 'bash', 'jobs', 'todo_write', 'web_fetch', 'web_search', 'ask_user_question']) {
       expect(available).toContain(name);

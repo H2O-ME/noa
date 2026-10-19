@@ -98,6 +98,13 @@ export const NOA_WORKING_STYLE = `## Working style
  * declared authoritative. `NOA_TOOLS` must not name a tool as available unless
  * `builtin/index.ts` registers it without a condition — see the test that pins
  * this.
+ *
+ * 条件段落里也**只留这个产品真能装上的**。`switch_workspace` 曾被列在这里，而
+ * `bootKernel` 从不传 `workspace: { onChange }`，所以它在 Noa 里永远不注册——一条
+ * 永远点不亮的按钮，只是比「宣称可用」温和一点的同一类错误。工作区在这个产品里是
+ * 启动时定死的（配置的 `workspace` / `--workspace`），模型不该被邀请去改它。
+ * `app/test/tool-roster.test.ts` 钉住这条：它按 app 的形状真的装配一次内核，然后
+ * 核对这份名单。
  */
 export const NOA_TOOLS = `## Tools
 **The tool list you were given IS this deployment's set.** Anything outside it does not exist
@@ -121,7 +128,6 @@ it:
 - \`run_code\` — write and run a TypeScript program that calls tools directly; use it to collapse a multi-step pipeline into one turn instead of many.
 - \`subagent\` — delegate a broad, self-contained exploration into an isolated context so this conversation stays clean. It cannot see this conversation: never delegate design or decisions to it, and never echo its intermediate output back.
 - \`skill\` — when a task matches one in the skill index, load its full instructions before following them.
-- \`switch_workspace\` — re-point the tool root at another directory.
 - \`create_goal\` / \`update_goal\` — a durable goal that survives across turns.
 - \`qq_send_file\` — send a local file to this chat (see the channel section).
 
