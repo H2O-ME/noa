@@ -10,6 +10,12 @@
  *
  * 两类就够了：可重试（含限频，等更久）与不可重试。原先还有第三类「撤回过期」
  * （40064004），随撤回机制一起删掉了——不再撤回任何消息，也就没有「撤回得太晚」。
+ *
+ * 另有一个**不是失败**的业务码：40054005「消息被去重」。平台按
+ * `(msg_id, msg_seq)` 去重，所以它出现时意味着**这一次发送之前已经投递成功过**
+ * ——恰恰是重试之后会遇到的那一种。把它读成失败，就会给一条已经到达的消息记上
+ * 「没发出去」，并让上层再补发一遍。`isDuplicateSend` 是它的判据，调用方据此
+ * 把它当成功处理。
  */
 import { QqTimeoutError } from './deadline.js';
 
@@ -22,6 +28,12 @@ const RETRYABLE_CODES = new Set([
 
 /** 限频：重试要等得更久，因为平台要的是「慢一点」，不是「再试一次」。 */
 const RATE_LIMIT_CODES = new Set([50002, 40113004]);
+
+/**
+ * 「这次 (msg_id, msg_seq) 已经投递过了」——不是失败，是**幂等回执**。
+ * 见 `protocol.ts` 的 `nextSeq`：同一窗口内 seq 不能重启，也正是这个去重码的来源。
+ */
+const DUPLICATE_SEND_CODES = new Set([40054005]);
 
 /** 传输层失败（连接被断、超时、DNS）：与业务码无关，重试有意义。 */
 const TRANSPORT_CODES = new Set([
@@ -87,6 +99,19 @@ export function isRateLimited(err: unknown): boolean {
   if (!(err instanceof QqApiError)) return false;
   const code = err.businessCode;
   return code !== undefined && RATE_LIMIT_CODES.has(code);
+}
+
+/**
+ * 这次发送是不是**已经到达过**（平台的去重回执）。
+ *
+ * 与 `isRetryable` 正交：它不是「再试一次」的理由，而是「不必再试，也别报失败」的
+ * 理由。重试一条消息时，若第一次其实已经投递（响应在回程丢了），第二次就会拿到这个
+ * 码——把它当失败会记下一条假的「没发出去」，并让上层补发一遍。
+ */
+export function isDuplicateSend(err: unknown): boolean {
+  if (!(err instanceof QqApiError)) return false;
+  const code = err.businessCode;
+  return code !== undefined && DUPLICATE_SEND_CODES.has(code);
 }
 
 /** 响应体里取一个数字字段（非对象、缺字段、类型不对一律 undefined）。 */

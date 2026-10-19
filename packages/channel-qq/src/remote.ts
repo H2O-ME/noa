@@ -590,7 +590,13 @@ export async function runRemoteCommand(command: RemoteCommand, ctx: RemoteContex
       // No seat: the honest answer. Saying "已切换" here would be the exact
       // failure this command family exists to avoid — a reply that reads as
       // done while the kernel never moved.
-      if (seat === undefined) return { reply: '这个进程没有工作区座位，换工作区请在界面里操作。' };
+      //
+      // 文案必须点出**这台部署真有的那条路**。原来说「请在界面里操作」，而常驻机器人
+      // 恰恰没有界面（无 GUI 服务器 / 手机遥控），那句话把人指向一个不存在的地方。
+      // 没有座位的装配里，工作区是启动时定死的，改它只有配置 + 重启一条路。
+      if (seat === undefined) {
+        return { reply: '这个进程没有工作区座位：工作区在启动时定死（config.json 的 workspace，或 --workspace），改完重启才生效。' };
+      }
       try {
         await seat(command.dir ?? '');
       } catch (err) {

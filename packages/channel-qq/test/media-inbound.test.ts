@@ -5,7 +5,9 @@
  *     每个「只发图」的消息都被静静丢掉。这里钉的是它与下游 `replyOnce` 的配合。
  *  2. **附件分类**：`content_type === 'file'` 是显式上传，绝不路由到语音识别；这是
  *     Hermes 里一条容易踩错的正确性细节，值得钉住。
- *  3. **去重有 TTL**：一个永不失效的容量集合会把很久之后复用同一 id 的消息当重复。
+ *  3. **去重的 TTL 由被动窗口推出来**：一个永不失效的容量集合会把很久之后复用同一 id
+ *     的消息当重复；反过来，TTL 短于窗口则会让重放的 msg_id 在窗口还没关时又跑一整轮。
+ *     所以这里的断言按最长窗口（C2C 55 分钟）分界，而不是按某个拍脑袋的常数。
  */
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -158,9 +160,12 @@ describe('inbound images reach the brain', () => {
 });
 
 describe('dedupe TTL', () => {
-  it('treats a reused msg_id after the window as a new message', async () => {
+  it('keeps a replayed msg_id a duplicate for as long as any reply window is open', async () => {
     // A capacity-bounded Set never forgot, so a message whose id came round again
-    // (or a reconnect replay) was silently swallowed.
+    // (or a reconnect replay) was silently swallowed. The fix is a TTL, and the
+    // TTL has to be at least the longest window in which a reply is still
+    // possible — otherwise a replay 6 minutes later starts a whole second turn
+    // while the first turn's answer is still deliverable.
     const seen: string[] = [];
     const reply: ReplySink = { reply: () => Promise.resolve({ ok: true }) };
     const handler = new InboundHandler({
@@ -170,6 +175,16 @@ describe('dedupe TTL', () => {
     });
     const message = (content: string): unknown => ({ id: 'SAME', group_openid: 'g1', author: { member_openid: 'u1' }, content });
     const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    const atOffset = async (ms: number, content: string): Promise<void> => {
+      const realNow = Date.now;
+      Date.now = () => realNow() + ms;
+      try {
+        handler.onDispatch({ t: 'GROUP_AT_MESSAGE_CREATE', d: message(content) });
+        await settle();
+      } finally {
+        Date.now = realNow;
+      }
+    };
 
     handler.onDispatch({ t: 'GROUP_AT_MESSAGE_CREATE', d: message('first') });
     await settle();
@@ -178,16 +193,14 @@ describe('dedupe TTL', () => {
     // Within the window it is a duplicate: only the first ran.
     expect(seen).toEqual(['first']);
 
-    // Past the TTL, the same id is a new message.
-    const realNow = Date.now;
-    Date.now = () => realNow() + 6 * 60_000;
-    try {
-      handler.onDispatch({ t: 'GROUP_AT_MESSAGE_CREATE', d: message('third') });
-      await settle();
-    } finally {
-      Date.now = realNow;
-    }
-    expect(seen).toEqual(['first', 'third']);
+    // Well past the old 5-minute TTL, but still inside the 55-minute C2C window:
+    // still a duplicate.
+    await atOffset(6 * 60_000, 'third');
+    expect(seen).toEqual(['first']);
+
+    // Past the longest window, the same id is a new message.
+    await atOffset(56 * 60_000, 'fourth');
+    expect(seen).toEqual(['first', 'fourth']);
   });
 });
 

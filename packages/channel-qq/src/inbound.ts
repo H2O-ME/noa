@@ -21,15 +21,45 @@ const C2C_WINDOW_MS = 55 * 60_000;
  * 事件去重的 TTL 与容量上限。
  *
  * The TTL is the correction: a plain capacity-bounded Set never expired, so a
- * `msg_id` reused hours later (or after a reconnect replay) was still treated as a
- * duplicate and the message was silently dropped. A window bounds memory AND
- * forgets, which is what "already seen" should mean.
+ * `msg_id` reused hours later was still treated as a duplicate and the message
+ * was silently dropped. A window bounds memory AND forgets, which is what
+ * "already seen" should mean.
+ *
+ * 但「有窗口」不等于「随便取一个窗口」。TTL 必须**至少覆盖最长的被动回复窗口**，
+ * 这条是从窗口本身推出来的：一个 `msg_id` 只在它自己的窗口内有意义，平台的重复推送
+ * （重连后的重放）也只会发生在那里。TTL 比窗口短，重放的那条就会被当成新消息——
+ * **再跑一整轮**：重复的 token 花费，以及重复的副作用（bash 再跑一遍、文件再写一遍）。
+ *
+ * 原先取 5 分钟，比单聊窗口（55 分钟）短了 50 分钟，正好落在这条路上。所以现在由
+ * 窗口推导，而不是各写一个数：两个数从此不可能再漂开。
  */
-const DEDUPE_TTL_MS = 5 * 60_000;
-const DEDUPE_CAP = 1_000;
+const DEDUPE_TTL_MS = Math.max(GROUP_WINDOW_MS, C2C_WINDOW_MS);
+/**
+ * 容量上限：TTL 拉长到 55 分钟后，1000 条在繁忙时段会被填满，而淘汰是**丢最旧的**——
+ * 那恰好是还在自己窗口里的那批 id，等于把上面那条 TTL 又缩短回去。4096 与
+ * `protocol.ts` 的 `SEQ_CAP` 同量级（同样按最长窗口保留），内存代价是几千个小字符串。
+ */
+const DEDUPE_CAP = 4_096;
 
 /** 一条有附件但没有可读内容（图片下载全失败等）的消息的答复。 */
 const NOTHING_READABLE_LINE = '（收到了消息，但里面没有我能读到的东西）';
+
+/**
+ * 补发寄存结论时加在前面的一行。
+ *
+ * 读者拿到的是一条**迟到的**答复，而它长得和及时答复一模一样——不说明的话，人只会
+ * 觉得机器人突然答非所问。这一行让迟到本身成为内容的一部分。
+ */
+const HELD_ANSWER_PREFIX = '（上一轮的结论，当时没发出去）';
+
+/**
+ * 每个对端最多寄存几条结论。
+ *
+ * 实际上到不了 2：平台只允许回复**最近一条**入站消息，所以下一条消息一到，窗口就是新
+ * 的，寄存的那条立刻被补发掉。上限只是防「补发本身也失败」时的无界增长——那时新的会
+ * 挤掉最旧的，并且记一行日志，而不是安静地吃掉一条。
+ */
+const HELD_ANSWER_CAP = 4;
 
 /**
  * 一次要跑的入站轮次：文本 + 原始附件。
@@ -107,6 +137,19 @@ export class InboundHandler {
   private readonly passive = new Map<string, { msgId: string; at: number }>();
   /** msg_id → 首次见到的时间戳（TTL 去重；见 `DEDUPE_TTL_MS`）。 */
   private readonly dedupe = new Map<string, number>();
+  /**
+   * 发不出去的**结论**，按对端寄存，等这个对端下一条消息把被动窗口带回来再补发。
+   *
+   * 这是「长任务在群里答不出来」的正面解法。平台的规则是硬约束：外发只能回复**最近一条**
+   * 入站消息，而那个窗口有期限（群 4.5 分钟、单聊 55 分钟）。一轮跑得比窗口长，结论就
+   * 没有任何合法的出口——原先的结局是**丢掉**，只在服务器日志里留一行「not sent」，而
+   * 那个握着手机的人以为机器人死了。
+   *
+   * 寄存把「丢掉」换成「迟到」：下一条消息（哪怕只是一句「还在吗」）一到，窗口就是新的，
+   * 结论随它一起发出去，再回答这条新消息。代价是读者会看到一条带说明的迟到答复，而那比
+   * 永远收不到好。
+   */
+  private readonly held = new Map<string, RemoteAnswer[]>();
   /** 本次运行的收发计数（口径见 `QqBotChannelStats`）：进程内存，重启归零。 */
   private received = 0;
   private replied = 0;
@@ -150,6 +193,9 @@ export class InboundHandler {
     this.closed = true;
     this.passive.clear();
     this.dedupe.clear();
+    // 寄存的结论也丢掉：一个已经关掉的通道没有任何窗口可以补发，而留着它们只是让一个
+    // 没有 fiber 的对象继续持有内容。
+    this.held.clear();
     this.queue = Promise.resolve();
   }
 
@@ -232,6 +278,10 @@ export class InboundHandler {
    */
   private async deliver(pending: PendingTurn, peer: Peer): Promise<void> {
     if (this.closed) return;
+    // 先补发寄存的结论：这一条消息刚落账，被动窗口是新的，而寄存的那条正是缺一个窗口。
+    // 放在插话/排队判定**之前**，因为补发只依赖窗口，不依赖这一轮怎么走。
+    await this.flushHeld(peer);
+    if (this.closed) return;
     const turn = await this.turnOf(pending, peer);
     if (this.closed) return;
     if (turn !== undefined && this.options.interject?.(turn, peer) === true) return;
@@ -239,6 +289,42 @@ export class InboundHandler {
     this.queue = this.queue
       .then(() => (turn === undefined ? this.answerUnreadable(peer) : this.replyOnce(turn, peer)))
       .catch(() => undefined);
+  }
+
+  /**
+   * 把寄存的结论补发出去（有则发，发不出去就原样放回）。
+   *
+   * 逐条发、遇到失败就停下并把**剩下的全部**放回队列：只放回失败的那条会让后面的悄悄
+   * 消失，而它们同样还没送到。顺序保持不变，读者看到的是当初该有的先后。
+   */
+  private async flushHeld(peer: Peer): Promise<void> {
+    const queue = this.held.get(peer.peerId);
+    if (queue === undefined || queue.length === 0) return;
+    this.held.delete(peer.peerId);
+    for (let i = 0; i < queue.length; i += 1) {
+      // `close()` may land while a send is in flight. A channel that has been
+      // switched off must not send: the remaining entries are dropped, not
+      // re-held — `close()` already means "nothing here is owed to anyone".
+      if (this.closed) return;
+      const answer = queue[i]!;
+      const marked: RemoteAnswer = { ...answer, text: `${HELD_ANSWER_PREFIX}\n\n${answer.text}` };
+      const outcome = await sendReply(this.options.reply, this.options.log, peer, marked, 'held');
+      if (outcome.ok) continue;
+      this.options.log(`qqbot: held answer for ${peer.peerId} still could not be delivered: ${outcome.reason ?? 'unknown'}`);
+      for (const rest of queue.slice(i)) this.hold(peer, rest);
+      return;
+    }
+  }
+
+  /** 寄存一条发不出去的结论（按对端、有上限、满了丢最旧并记日志）。 */
+  private hold(peer: Peer, answer: RemoteAnswer): void {
+    const queue = this.held.get(peer.peerId) ?? [];
+    queue.push(answer);
+    while (queue.length > HELD_ANSWER_CAP) {
+      const dropped = queue.shift();
+      this.options.log(`qqbot: held-answer buffer for ${peer.peerId} is full; dropping the oldest (${dropped?.text.length ?? 0} chars)`);
+    }
+    this.held.set(peer.peerId, queue);
   }
 
   /**
@@ -304,6 +390,12 @@ export class InboundHandler {
   private async runRemote(text: string, peer: Peer): Promise<void> {
     const { remote, reply, log } = this.options;
     if (remote === undefined) return;
+    // 遥控指令也可能是一句「刚才那个跑完了吗」——它同样是这个对端带来新窗口的机会，
+    // 所以补发也挂在这里（`deliver` 那条路走的是另一个入口）。
+    await this.flushHeld(peer);
+    // A shutdown during the flush wins over the command: running it would execute
+    // tools on behalf of a channel that is supposed to be gone.
+    if (this.closed) return;
     try {
       const raw = await remote.handle(text, peer);
       // A shutdown that landed while the command ran wins: its answer describes a
@@ -312,7 +404,7 @@ export class InboundHandler {
       // `undefined` = 这条指令没有立即答复（例如它已经自己发过消息了）。
       if (raw === undefined) return;
       const answer: RemoteAnswer = typeof raw === 'string' ? { text: raw } : raw;
-      if (await sendReply(reply, log, peer, answer, 'remote')) this.replied += 1;
+      if ((await sendReply(reply, log, peer, answer, 'remote')).ok) this.replied += 1;
     } catch (err) {
       log(`remote failed for ${peer.peerId}: ${errMessage(err)}`);
     }
@@ -331,14 +423,26 @@ export class InboundHandler {
       answer = { text: '（处理消息时出错，请稍后重试）' };
     }
     if (this.closed) return;
-    if (await sendReply(reply, log, peer, answer, 'replied')) this.replied += 1;
+    const outcome = await sendReply(reply, log, peer, answer, 'replied');
+    if (outcome.ok) {
+      this.replied += 1;
+      return;
+    }
+    // 结论发不出去：寄存，等这个对端下一条消息把窗口带回来。只有**这一轮的工作成果**
+    // 走这条路——遥控指令的答复（`/status` 之类）不寄存，它们一条命令就能重新问一次，
+    // 而一条跑了十分钟的结论没有第二次机会。
+    //
+    // 空答复不寄存：那是「无话可说」，不是丢失（打断的那一轮正是这种）。
+    if (answer.text.trim().length === 0) return;
+    log(`qqbot: holding the answer for ${peer.peerId} until its next message (${outcome.reason ?? 'unknown'})`);
+    this.hold(peer, answer);
   }
 
   /** 一条有附件但没有可读内容的消息：如实回一句，不开空轮次。 */
   private async answerUnreadable(peer: Peer): Promise<void> {
     if (this.closed) return;
     const { reply, log } = this.options;
-    if (await sendReply(reply, log, peer, { text: NOTHING_READABLE_LINE }, 'replied')) this.replied += 1;
+    if ((await sendReply(reply, log, peer, { text: NOTHING_READABLE_LINE }, 'replied')).ok) this.replied += 1;
   }
 
   /**

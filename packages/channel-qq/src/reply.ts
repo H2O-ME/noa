@@ -21,12 +21,18 @@ export interface ReplySink {
  *
  * Empty answers are dropped silently: an empty reply is not a failed reply, it is
  * nothing to say, and the gateway would reject it anyway.
+ *
+ * The **reason** is returned rather than only logged, because the caller decides
+ * what a refusal means: an answer the peer was waiting for can be HELD until
+ * their next message brings a fresh passive window back (see `inbound.ts`), while
+ * a command's output can simply be asked for again. A boolean here forced every
+ * caller to treat "the window closed" and "nothing to say" as the same fact.
  * @param reply - the outbound seam, injected by the channel.
  * @param log - where a failure line goes.
  * @param peer - who to answer.
  * @param answer - the answer, as text plus optional rich styling.
  * @param tag - the log prefix naming the path (`remote` vs the queue).
- * @returns whether a reply actually went out (false: nothing to say, or refused).
+ * @returns whether it went out, and why not when it did not.
  */
 export async function sendReply(
   reply: ReplySink,
@@ -34,15 +40,16 @@ export async function sendReply(
   peer: Peer,
   answer: RemoteAnswer | string,
   tag: string,
-): Promise<boolean> {
+): Promise<{ ok: boolean; reason?: string }> {
   const text = (typeof answer === 'string' ? answer : answer.text).trim();
-  if (text.length === 0) return false;
+  if (text.length === 0) return { ok: false, reason: 'nothing to say' };
   const rich = typeof answer === 'string' ? undefined : answer.rich;
   const result = await reply.reply(peer.peerId, text, rich);
   if (result.ok) {
     log(`${tag} ${peer.peerId}: sent`);
-    return true;
+    return { ok: true };
   }
-  log(`${tag} not sent for ${peer.peerId}: ${result.reason ?? 'the outbox refused without a reason'}`);
-  return false;
+  const reason = result.reason ?? 'the outbox refused without a reason';
+  log(`${tag} not sent for ${peer.peerId}: ${reason}`);
+  return { ok: false, reason };
 }

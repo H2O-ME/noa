@@ -26,7 +26,7 @@ export {
   type RichSend,
 } from './rich-send.js';
 import { buildMessagePlan, type RichSend } from './rich-send.js';
-import { QqApiError } from './api-error.js';
+import { isDuplicateSend, isRateLimited, isRetryable, QqApiError } from './api-error.js';
 import { withDeadline } from './deadline.js';
 import type { AccessTokenManager, FetchLike } from './token.js';
 import { uploadLocalFile } from './upload.js';
@@ -52,6 +52,15 @@ export interface SendOptions {
 const IDENTITY_TIMEOUT_MS = 3_000;
 
 /**
+ * 一条被平台判为「已经投递过」的消息在 `SentMessage.id` 上的占位。
+ *
+ * 平台不给这种回执发消息 id（它没有新消息），但这一次发送**是成功的**，所以不能走
+ * 「没有 id 就是没送达」那条路。这个占位只是让调用方拿到一个非空字符串；它不会被读
+ * ——本包没有任何一处依赖回复的 id。
+ */
+export const DUPLICATE_SEND_RECEIPT = 'qqbot:duplicate-send';
+
+/**
  * msg_seq 账本的保留窗口与容量上限。
  *
  * 一个 `msg_id` 的 seq 只需要活到它自己的被动窗口结束：窗口一过，对它再发消息本来就会
@@ -64,6 +73,42 @@ const IDENTITY_TIMEOUT_MS = 3_000;
  */
 const SEQ_TTL_MS = 60 * 60_000;
 const SEQ_CAP = 4_096;
+
+/**
+ * 一次 REST 调用的重试预算。
+ *
+ * 存在的理由和 `api-error.ts` 是同一件事：这个平台的失败判据是**业务码**，而它把
+ * 「系统繁忙，请稍后重试」以 HTTP 500 返回、把「分片发送过快」以 404 返回。既然
+ * `isRetryable` / `isRateLimited` 已经把「该不该重试、该等多久」判出来了，就必须有人
+ * 真的去重试——这两个函数曾经导出后**没有任何调用点**，于是平台抖一下，一条回复就没了。
+ *
+ * 重发同一条消息是安全的：平台按 `(msg_id, msg_seq)` 去重，所以第一次其实已经投递的
+ * 那种情况，第二次会拿到 40054005，而那个码被读成**成功**（`isDuplicateSend`），不是
+ * 失败。这条幂等性正是敢在这里重试消息的原因。
+ */
+export interface QqRetryPolicy {
+  /** 首发算一次：3 表示最多 1 次首发 + 2 次重试。 */
+  maxAttempts: number;
+  /** 一般可重试失败的基础等待，按次数翻倍。 */
+  baseDelayMs: number;
+  /** 限频那档的等待：平台要的是「慢一点」，退避不够。 */
+  rateLimitDelayMs: number;
+}
+
+export const DEFAULT_RETRY_POLICY: QqRetryPolicy = {
+  maxAttempts: 3,
+  baseDelayMs: 500,
+  rateLimitDelayMs: 2_000,
+};
+
+/** 单次等待的上限：重试不该比它要救的那条被动回复窗口还长。 */
+const RETRY_MAX_DELAY_MS = 8_000;
+
+/** 把 1 起算的尝试号变成这一次该等多久。 */
+function retryDelayMs(policy: QqRetryPolicy, attempt: number, rateLimited: boolean): number {
+  if (rateLimited) return Math.min(policy.rateLimitDelayMs * attempt, RETRY_MAX_DELAY_MS);
+  return Math.min(policy.baseDelayMs * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
+}
 
 /**
  * REST 发消息客户端：群聊 `POST /v2/groups/{group_openid}/messages`、
@@ -79,6 +124,7 @@ export class QqApi {
     private readonly fetchFn: FetchLike,
     private readonly baseUrl = 'https://api.sgroup.qq.com',
     private readonly log: (line: string) => void = () => undefined,
+    private readonly retry: QqRetryPolicy = DEFAULT_RETRY_POLICY,
   ) {}
 
   async sendGroupMessage(groupOpenid: string, opts: SendOptions): Promise<SentMessage[]> {
@@ -178,12 +224,23 @@ export class QqApi {
    * body 的方式不同，而「发出并核对」是同一个动作。
    */
   private async requestMessage(path: string, body: Record<string, unknown>): Promise<string> {
-    // 失败时补上 msg_type：媒体（7）被拒与纯文本（0）被拒是两回事，而两者的错误
-    // 前缀完全一样（都出自 `request`），850019「富媒体文件格式不支持」正是只在
-    // msg_type 7 上出现的那种——不带上它就分不清是消息被拒还是上传被拒。
-    const parsed = await this.request(path, body).catch((err: unknown) => {
+    let parsed: unknown;
+    try {
+      parsed = await this.request(path, body);
+    } catch (err) {
+      // 去重回执（40054005）不是失败：平台按 `(msg_id, msg_seq)` 去重，所以这个码
+      // 意味着这一次发送**之前已经投递成功**——典型来路正是重试一条「响应在回程
+      // 丢了」的消息。读成失败会给一条已经到达的消息记上「没发出去」，上层据此再补发
+      // 一遍，读者就收到两份。
+      if (isDuplicateSend(err)) {
+        this.log(`qqbot: ${path} was already delivered (platform dedup); treating it as sent`);
+        return DUPLICATE_SEND_RECEIPT;
+      }
+      // 失败时补上 msg_type：媒体（7）被拒与纯文本（0）被拒是两回事，而两者的错误
+      // 前缀完全一样（都出自 `request`），850019「富媒体文件格式不支持」正是只在
+      // msg_type 7 上出现的那种——不带上它就分不清是消息被拒还是上传被拒。
       throw new Error(`${String(err)} [msg_type ${String(body['msg_type'])}]`);
-    });
+    }
     // A 2xx whose body carries no message id is NOT a delivered message. It was
     // previously counted as one (`id: ''`), so a platform rejection that still
     // answered 200 inflated the channel's reply tally and told the model the
@@ -238,7 +295,37 @@ export class QqApi {
     await this.request(`/interactions/${interactionId}`, { code: 0 });
   }
 
+  /**
+   * One REST call, with the retry budget spent on failures that are worth retrying.
+   *
+   * The classification is `api-error.ts`'s (business code first, status only as a
+   * fallback) and the delay is longer for a rate limit, because what the platform
+   * asked for there is "slower", not "again". Retrying a MESSAGE send is safe:
+   * the platform dedups on `(msg_id, msg_seq)`, so an attempt that actually
+   * landed comes back as a duplicate-send receipt, which `requestMessage` reads
+   * as delivered.
+   * @param path - the endpoint path.
+   * @param body - the request body, re-sent verbatim (same msg_seq → idempotent).
+   * @returns the parsed response body.
+   */
   private async request(path: string, body: unknown): Promise<unknown> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= this.retry.maxAttempts; attempt += 1) {
+      try {
+        return await this.requestOnce(path, body);
+      } catch (err) {
+        lastError = err;
+        if (attempt >= this.retry.maxAttempts || !isRetryable(err)) throw err;
+        const wait = retryDelayMs(this.retry, attempt, isRateLimited(err));
+        this.log(`qqbot: ${path} failed (attempt ${attempt}/${this.retry.maxAttempts}), retrying in ${wait}ms: ${String(err)}`);
+        await new Promise<void>((resolve) => setTimeout(resolve, wait));
+      }
+    }
+    // 循环只在每次尝试都失败时走到底；上面最后一次已经 throw，这行是给类型看的。
+    throw lastError;
+  }
+
+  private async requestOnce(path: string, body: unknown): Promise<unknown> {
     const token = await this.token.get();
     const [status, payload] = await withDeadline(async (signal) => {
       const res = await this.fetchFn(`${this.baseUrl}${path}`, {

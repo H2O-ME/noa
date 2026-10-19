@@ -233,8 +233,11 @@ export class QqOutbox {
     if (spent(ledger) >= this.windowAllowance) {
       // The reserve is gone too: the platform's own bound is what is left, and
       // sending into it fails at the platform rather than here. Refusing is the
-      // honest report; the text is already durable in the session log, so nothing
-      // is lost that `/history` cannot reach.
+      // honest report, and the text is durable in the session log on the server.
+      //
+      // 拒绝不等于丢掉：**决定权在调用方**。入站处理器会把这一轮的结论寄存下来，等这个
+      // 对端下一条消息把新的被动窗口带回来再补发（见 `inbound.ts` 的 `held`）。出站账本
+      // 只管「这一条现在能不能发」，不管「这条消息还有没有别的去处」。
       return { ok: false, reason: `reply allowance spent for this message (${this.windowAllowance})` };
     }
     ledger.reply += 1;

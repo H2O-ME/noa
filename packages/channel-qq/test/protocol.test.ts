@@ -149,6 +149,96 @@ describe('QqApi', () => {
   });
 });
 
+/**
+ * REST 层的重试。
+ *
+ * 判据（业务码优先、状态码兜底）住在 `api-error.ts`，而这里钉的是**真的有人拿它去
+ * 重试**：`isRetryable` / `isRateLimited` 曾经导出后没有任何调用点，于是平台把
+ * 「系统繁忙，请稍后重试」（HTTP 500）或「分片发送过快」（HTTP 404）返回一次，
+ * 那条回复就没了。
+ */
+describe('QqApi retry', () => {
+  /** 1ms / 2ms 的等待：测的是分档，不是墙钟。 */
+  const fastRetry = { maxAttempts: 3, baseDelayMs: 1, rateLimitDelayMs: 2 };
+  const freshToken = (): AccessTokenManager =>
+    new AccessTokenManager('app', 'secret', async () => jsonResponse(200, { access_token: 't', expires_in: 7200 }));
+
+  it('retries a transient business code instead of losing the reply', async () => {
+    let attempts = 0;
+    const api = new QqApi(
+      freshToken(),
+      async () => {
+        attempts += 1;
+        // 50015001「系统繁忙，请稍后重试」，平台用 HTTP 500 送出来。
+        return attempts === 1 ? jsonResponse(500, { code: 50015001 }) : jsonResponse(200, { id: 'msg-1' });
+      },
+      'https://api.sgroup.qq.com',
+      () => undefined,
+      fastRetry,
+    );
+
+    const sent = await api.sendC2CMessage('U1', { content: 'hi', msgId: 'm1' });
+    expect(sent.map((entry) => entry.id)).toEqual(['msg-1']);
+    expect(attempts).toBe(2);
+  });
+
+  it('does not retry a terminal failure', async () => {
+    let attempts = 0;
+    const api = new QqApi(
+      freshToken(),
+      async () => {
+        attempts += 1;
+        return jsonResponse(400, { code: 40034001 });
+      },
+      'https://api.sgroup.qq.com',
+      () => undefined,
+      fastRetry,
+    );
+
+    await expect(api.sendC2CMessage('U1', { content: 'hi', msgId: 'm1' })).rejects.toThrow('send failed (400)');
+    expect(attempts).toBe(1);
+  });
+
+  it('gives a rate limit the longer wait, on the business code and not the status', async () => {
+    const lines: string[] = [];
+    let attempts = 0;
+    const api = new QqApi(
+      freshToken(),
+      async () => {
+        attempts += 1;
+        // 40113004「消息分片发送过快」——平台用 HTTP **404** 送出来。按状态码分类会把
+        // 它当永久失败，于是对着一个「慢一点就好」的失败直接收手。
+        return attempts === 1 ? jsonResponse(404, { err_code: 40113004 }) : jsonResponse(200, { id: 'msg-1' });
+      },
+      'https://api.sgroup.qq.com',
+      (line) => lines.push(line),
+      fastRetry,
+    );
+
+    await api.sendC2CMessage('U1', { content: 'hi', msgId: 'm1' });
+    expect(attempts).toBe(2);
+    // 限频那档按 rateLimitDelayMs 等，不是基础退避（1ms）。
+    expect(lines.join('\n')).toContain('retrying in 2ms');
+  });
+
+  it('reads a duplicate-send receipt as delivered rather than as a failure', async () => {
+    // 平台按 (msg_id, msg_seq) 去重，所以重试一条其实已经投递的消息会拿到
+    // 40054005。当成失败会给一条已经到达的消息记上「没发出去」，并让上层补发第二遍。
+    const lines: string[] = [];
+    const api = new QqApi(
+      freshToken(),
+      async () => jsonResponse(400, { code: 40054005 }),
+      'https://api.sgroup.qq.com',
+      (line) => lines.push(line),
+      fastRetry,
+    );
+
+    const sent = await api.sendC2CMessage('U1', { content: 'hi', msgId: 'm1' });
+    expect(sent).toHaveLength(1);
+    expect(lines.join('\n')).toContain('already delivered');
+  });
+});
+
 describe('parseInbound', () => {
   it('parses group and c2c messages into peers, ignoring other events', () => {
     const group = parseInbound('GROUP_AT_MESSAGE_CREATE', {
